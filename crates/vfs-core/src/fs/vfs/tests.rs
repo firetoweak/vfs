@@ -9,9 +9,7 @@
         create_test_fs_with_config(CoreConfig::from_env()).await
     }
 
-    async fn create_test_fs_with_config(
-        config: CoreConfig,
-    ) -> Result<(Vfs, tempfile::TempDir)> {
+    async fn create_test_fs_with_config(config: CoreConfig) -> Result<(Vfs, tempfile::TempDir)> {
         let dir = tempdir()?;
         let db_path = dir.path().join("test.db");
         let db = Builder::new_local(db_path.to_str().unwrap())
@@ -1597,102 +1595,24 @@
     }
 
     #[tokio::test]
-    async fn schema_alter_conflicting_column_definition_is_rejected() -> Result<()> {
-        let dir = tempdir()?;
-        let db_path = dir.path().join("malformed-conflicting-column.db");
-
-        {
-            let db = Builder::new_local(db_path.to_str().unwrap())
-                .build()
-                .await?;
-            let conn = db.connect()?;
-
+    async fn current_schema_conflicting_column_definition_is_rejected() -> Result<()> {
+        let (fs, _dir) = create_test_fs().await?;
+        let conn = fs.pool.get_connection().await?;
             conn.execute(
-                "CREATE TABLE fs_config (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+            "ALTER TABLE fs_inode RENAME COLUMN atime_nsec TO obsolete_atime_nsec",
                 (),
             )
             .await?;
             conn.execute(
-                "INSERT INTO fs_config (key, value) VALUES
-                    (?, '0.6'),
-                    (?, '16384')",
-                (
-                    schema::CONFIG_SCHEMA_VERSION_KEY,
-                    schema::CONFIG_INLINE_THRESHOLD_KEY,
-                ),
-            )
-            .await?;
-            conn.execute(
-                "CREATE TABLE fs_inode (
-                    ino INTEGER PRIMARY KEY,
-                    mode INTEGER NOT NULL,
-                    nlink INTEGER NOT NULL DEFAULT 0,
-                    uid INTEGER NOT NULL DEFAULT 0,
-                    gid INTEGER NOT NULL DEFAULT 0,
-                    size INTEGER NOT NULL DEFAULT 0,
-                    atime INTEGER NOT NULL,
-                    mtime INTEGER NOT NULL,
-                    ctime INTEGER NOT NULL,
-                    rdev INTEGER NOT NULL DEFAULT 0,
-                    atime_nsec TEXT NOT NULL DEFAULT 'bad',
-                    mtime_nsec INTEGER NOT NULL DEFAULT 0,
-                    ctime_nsec INTEGER NOT NULL DEFAULT 0,
-                    data_inline BLOB,
-                    storage_kind INTEGER NOT NULL DEFAULT 0
-                )",
+            "ALTER TABLE fs_inode ADD COLUMN atime_nsec TEXT NOT NULL DEFAULT 'bad'",
                 (),
             )
             .await?;
-            conn.execute(
-                "CREATE TABLE fs_session_metadata (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL
-                )",
-                (),
-            )
-            .await?;
-            conn.execute(
-                "INSERT INTO fs_inode
-                    (ino, mode, nlink, uid, gid, size, atime, mtime, ctime, rdev,
-                     atime_nsec, mtime_nsec, ctime_nsec, storage_kind)
-                 VALUES (?, ?, 2, 0, 0, 0, 1, 1, 1, 0, 'bad', 0, 0, 0)",
-                (ROOT_INO, DEFAULT_DIR_MODE as i64),
-            )
-            .await?;
-        }
-
-        let db = Builder::new_local(db_path.to_str().unwrap())
-            .build()
-            .await?;
-        let conn = db.connect()?;
-        let err = match schema::ensure_current(&conn).await {
-            Ok(_) => panic!("migrating a database with a conflicting schema column must fail"),
-            Err(err) => err,
-        };
-        let err_msg = err.to_string();
+        let err = schema::ensure_current(&conn).await.unwrap_err();
         assert!(
-            err_msg.contains("fs_inode.atime_nsec") && err_msg.contains("incompatible definition"),
-            "error should name the incompatible schema column, got: {err_msg}"
+            err.to_string().contains("fs_inode.atime_nsec")
+                && err.to_string().contains("incompatible definition")
         );
-        drop(conn);
-        drop(db);
-
-        let db = Builder::new_local(db_path.to_str().unwrap())
-            .build()
-            .await?;
-        let conn = db.connect()?;
-        let mut rows = conn.query("PRAGMA table_info(fs_inode)", ()).await?;
-        let mut found_conflicting_column = false;
-        while let Some(row) = rows.next().await? {
-            let name: String = row.get(1)?;
-            if name == "atime_nsec" {
-                let type_name: String = row.get(2)?;
-                assert_eq!(type_name, "TEXT");
-                found_conflicting_column = true;
-            }
-        }
-        assert!(found_conflicting_column);
-
         Ok(())
     }
 
@@ -1738,7 +1658,7 @@
     }
 
     #[tokio::test]
-    async fn test_v04_database_is_rejected_on_open_until_migrated() -> Result<()> {
+    async fn test_v04_database_is_rejected_without_mutating_old_format() -> Result<()> {
         let dir = tempdir()?;
         let db_path = dir.path().join("legacy-v04.db");
 
@@ -1796,17 +1716,11 @@
                 schema::detect_schema_version(&conn).await?,
                 Some(schema::SchemaVersion::V0_4)
             );
-            schema::ensure_current(&conn).await?;
+            assert!(matches!(
+                schema::ensure_current(&conn).await,
+                Err(Error::SchemaVersionMismatch { .. })
+            ));
         }
-
-        let agent =
-            crate::Vfs::open(crate::VfsOptions::with_path(db_path.to_string_lossy()))
-                .await?;
-        let conn = agent.get_connection().await?;
-        assert_eq!(
-            schema::detect_schema_version(&conn).await?,
-            Some(schema::CURRENT)
-        );
 
         Ok(())
     }

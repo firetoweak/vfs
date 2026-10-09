@@ -208,7 +208,10 @@ impl VfsOptions {
                     .display()
                     .to_string(),
             })
-        } else if id_or_path.contains(std::path::MAIN_SEPARATOR) || path.extension().is_some() {
+        } else if id_or_path.contains(std::path::MAIN_SEPARATOR)
+            || id_or_path.contains('/')
+            || path.extension().is_some()
+        {
             // Path-shaped (has a separator or an extension) but nothing exists
             // there: an "invalid agent ID" complaint would be misleading.
             Err(Error::DatabaseNotFound(id_or_path))

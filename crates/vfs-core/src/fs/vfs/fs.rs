@@ -19,6 +19,10 @@ use super::*;
 
 #[async_trait]
 impl FileSystem for Vfs {
+    fn file_identity(&self, ino: i64) -> Result<String> {
+        Ok(format!("vfs:{}:{ino}", self.filesystem_id))
+    }
+
     async fn lookup(&self, parent_ino: i64, name: &str) -> Result<Option<Stats>> {
         crate::telemetry::record_lookup();
         if name.len() > MAX_NAME_LEN {
@@ -131,7 +135,9 @@ impl FileSystem for Vfs {
     /// The keepcache-delta kill switch restores the old policy where only
     /// host-backed base-layer files were eligible.
     async fn keep_cache_for_read_open(&self, ino: i64, flags: i32) -> Result<Option<Stats>> {
-        if (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0 {
+        if (flags & (libc::O_WRONLY | libc::O_RDWR)) != libc::O_RDONLY
+            || (flags & libc::O_TRUNC) != 0
+        {
             return Ok(None);
         }
         if !self.core_config.keepcache_delta {

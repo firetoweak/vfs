@@ -3,7 +3,6 @@
 use crate::error::{Error, Result};
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::fs;
 use std::path::{Component, Path, PathBuf};
 use turso::{Connection, Value};
 
@@ -179,6 +178,16 @@ pub async fn check(conn: &Connection, opts: &CheckOpts) -> Result<Report> {
 }
 
 async fn check_config(conn: &Connection, report: &mut Report) -> Result<()> {
+    let filesystem_id = config_string(conn, super::CONFIG_FILESYSTEM_ID_KEY).await?;
+    let valid = filesystem_id
+        .as_deref()
+        .is_some_and(super::valid_filesystem_identity);
+    report.push_check(
+        "config.filesystem_id",
+        valid,
+        filesystem_id.unwrap_or_else(|| "missing".into()),
+        Some(i64::from(!valid)),
+    );
     let schema_version = config_string(conn, "schema_version").await?;
     report.push_check(
         "config.schema_version",
@@ -911,13 +920,7 @@ async fn check_partial_origin_base_fingerprints(
     for partial in &partial_rows {
         let result = (|| -> Result<()> {
             let base_path = resolve_materialization_base_path(&base_root, &partial.base_path)?;
-            let metadata = fs::metadata(&base_path).map_err(|err| {
-                Error::Internal(format!(
-                    "Failed to stat base file {}: {err}",
-                    base_path.display()
-                ))
-            })?;
-            validate_base_fingerprint(partial, &metadata, &base_path)
+            validate_base_fingerprint(partial, &base_path)
         })();
         if let Err(err) = result {
             violations += 1;
@@ -1039,12 +1042,8 @@ fn resolve_materialization_base_path(base_root: &Path, recorded_path: &str) -> R
     Ok(canonical)
 }
 
-fn validate_base_fingerprint(
-    partial: &PartialOriginRow,
-    metadata: &fs::Metadata,
-    path: &Path,
-) -> Result<()> {
-    let fingerprint = metadata_fingerprint(metadata);
+fn validate_base_fingerprint(partial: &PartialOriginRow, path: &Path) -> Result<()> {
+    let fingerprint = crate::fs::base_fingerprint::BaseFingerprint::from_path(path)?;
     if fingerprint.size != partial.base_fingerprint_size
         || fingerprint.mtime != partial.base_mtime
         || fingerprint.mtime_nsec != partial.base_mtime_nsec
@@ -1060,43 +1059,6 @@ fn validate_base_fingerprint(
         )));
     }
     Ok(())
-}
-
-struct FileFingerprint {
-    size: i64,
-    mtime: i64,
-    mtime_nsec: i64,
-    ctime: i64,
-    ctime_nsec: i64,
-}
-
-#[cfg(unix)]
-fn metadata_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
-    use std::os::unix::fs::MetadataExt;
-    FileFingerprint {
-        size: metadata.len() as i64,
-        mtime: metadata.mtime(),
-        mtime_nsec: metadata.mtime_nsec(),
-        ctime: metadata.ctime(),
-        ctime_nsec: metadata.ctime_nsec(),
-    }
-}
-
-#[cfg(not(unix))]
-fn metadata_fingerprint(metadata: &fs::Metadata) -> FileFingerprint {
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| (duration.as_secs() as i64, duration.subsec_nanos() as i64))
-        .unwrap_or((0, 0));
-    FileFingerprint {
-        size: metadata.len() as i64,
-        mtime: modified.0,
-        mtime_nsec: modified.1,
-        ctime: 0,
-        ctime_nsec: 0,
-    }
 }
 
 async fn add_zero_count_check(

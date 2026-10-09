@@ -225,7 +225,7 @@ impl Lifecycle {
         self.reap_hooks.lock().unwrap().iter().cloned().collect()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn reap_hook_count(&self) -> usize {
         self.reap_hooks.lock().unwrap().len()
     }

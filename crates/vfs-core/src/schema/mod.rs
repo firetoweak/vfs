@@ -14,11 +14,11 @@ use turso::transaction::{Transaction, TransactionBehavior};
 use turso::{Connection, Value};
 
 /// Current schema version.
-pub const CURRENT: SchemaVersion = SchemaVersion::V0_8;
+pub const CURRENT: SchemaVersion = SchemaVersion::V0_10;
 
-/// Oldest schema version with a migration path to [`CURRENT`]; the artifact
-/// version floor for `vfs adopt` and `vfs migrate`.
-pub const MIN_SUPPORTED: SchemaVersion = SchemaVersion::V0_0;
+/// Oldest accepted format. Earlier origins lack either persistent native
+/// identities or the owning namespace needed to disambiguate layered files.
+pub const MIN_SUPPORTED: SchemaVersion = SchemaVersion::V0_10;
 
 /// Compatibility string for callers that still surface the historical version.
 pub const VFS_SCHEMA_VERSION: &str = CURRENT.as_str();
@@ -29,6 +29,7 @@ pub const CONFIG_HISTORY_EPOCH_KEY: &str = "history_epoch";
 pub const CONFIG_HISTORY_VALID_KEY: &str = "history_valid";
 pub const CONFIG_HISTORY_FLOOR_SEQ_KEY: &str = "history_floor_seq";
 pub const CONFIG_CHUNKS_HOLLOW_KEY: &str = "chunks_hollow";
+pub(crate) const CONFIG_FILESYSTEM_ID_KEY: &str = "filesystem_id";
 
 /// Aggregate content removed when a database is converted to a metadata artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +211,10 @@ pub enum SchemaVersion {
     V0_7,
     /// Added replayable row-delta history and relational root snapshots
     V0_8,
+    /// Persistent base identities replace process-local origin inode numbers.
+    V0_9,
+    /// Persistent filesystem namespaces distinguish files born in different deltas.
+    V0_10,
 }
 
 impl std::fmt::Display for SchemaVersion {
@@ -229,6 +234,8 @@ impl SchemaVersion {
             SchemaVersion::V0_6 => "0.6",
             SchemaVersion::V0_7 => "0.7",
             SchemaVersion::V0_8 => "0.8",
+            SchemaVersion::V0_9 => "0.9",
+            SchemaVersion::V0_10 => "0.10",
         }
     }
 
@@ -242,6 +249,8 @@ impl SchemaVersion {
             SchemaVersion::V0_6 => 6,
             SchemaVersion::V0_7 => 7,
             SchemaVersion::V0_8 => 8,
+            SchemaVersion::V0_9 => 9,
+            SchemaVersion::V0_10 => 10,
         }
     }
 
@@ -260,6 +269,8 @@ impl SchemaVersion {
             "0.6" => Some(SchemaVersion::V0_6),
             "0.7" => Some(SchemaVersion::V0_7),
             "0.8" => Some(SchemaVersion::V0_8),
+            "0.9" => Some(SchemaVersion::V0_9),
+            "0.10" => Some(SchemaVersion::V0_10),
             _ => None,
         }
     }
@@ -273,6 +284,8 @@ impl SchemaVersion {
             6 => Some(SchemaVersion::V0_6),
             7 => Some(SchemaVersion::V0_7),
             8 => Some(SchemaVersion::V0_8),
+            9 => Some(SchemaVersion::V0_9),
+            10 => Some(SchemaVersion::V0_10),
             _ => None,
         }
     }
@@ -286,38 +299,8 @@ pub struct Migration {
     pub description: &'static str,
 }
 
-const MIGRATIONS: &[Migration] = &[
-    Migration {
-        from: SchemaVersion::V0_0,
-        to: SchemaVersion::V0_2,
-        description: "add fs_inode.nlink",
-    },
-    Migration {
-        from: SchemaVersion::V0_2,
-        to: SchemaVersion::V0_4,
-        description: "add nanosecond timestamps and rdev",
-    },
-    Migration {
-        from: SchemaVersion::V0_4,
-        to: SchemaVersion::V0_5,
-        description: "add inline storage and overlay schema sections",
-    },
-    Migration {
-        from: SchemaVersion::V0_5,
-        to: SchemaVersion::V0_6,
-        description: "add persistent session handoff metadata",
-    },
-    Migration {
-        from: SchemaVersion::V0_6,
-        to: SchemaVersion::V0_7,
-        description: "content-address file chunks",
-    },
-    Migration {
-        from: SchemaVersion::V0_7,
-        to: SchemaVersion::V0_8,
-        description: "replace semantic journal rows with replayable row deltas and snapshots",
-    },
-];
+// Earlier origin references cannot be assigned owning namespaces without guessing.
+const MIGRATIONS: &[Migration] = &[];
 
 /// Ordered migrations to the current schema.
 pub fn migrations() -> &'static [Migration] {
@@ -475,7 +458,7 @@ mod ddl {
         "CREATE TABLE IF NOT EXISTS fs_snapshot_origin (
             snapshot_id INTEGER NOT NULL,
             delta_ino INTEGER NOT NULL,
-            base_ino INTEGER NOT NULL,
+            base_identity TEXT NOT NULL,
             PRIMARY KEY (snapshot_id, delta_ino)
         )",
         "CREATE TABLE IF NOT EXISTS fs_snapshot_partial_origin (
@@ -512,7 +495,7 @@ mod ddl {
         )",
         "CREATE TABLE IF NOT EXISTS fs_origin (
             delta_ino INTEGER PRIMARY KEY,
-            base_ino INTEGER NOT NULL
+            base_identity TEXT NOT NULL UNIQUE
         )",
         "CREATE TABLE IF NOT EXISTS fs_partial_origin (
             delta_ino INTEGER PRIMARY KEY,
@@ -582,6 +565,20 @@ struct ColumnSpec {
 }
 
 const CURRENT_COLUMN_SPECS: &[ColumnSpec] = &[
+    ColumnSpec {
+        table_name: "fs_origin",
+        column_name: "base_identity",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+    },
+    ColumnSpec {
+        table_name: "fs_snapshot_origin",
+        column_name: "base_identity",
+        type_name: "TEXT",
+        not_null: true,
+        default_value: None,
+    },
     ColumnSpec {
         table_name: "fs_inode",
         column_name: "nlink",
@@ -796,28 +793,38 @@ pub async fn require_current(conn: &Connection, has_chunk_source: bool) -> Resul
     Ok(hollow)
 }
 
-/// Ensure the database is at [`CURRENT`], running all pending migrations inside
-/// a single IMMEDIATE transaction and stamping `PRAGMA user_version` before the
-/// DDL transaction commits.
+/// Initialize a new database or validate the current format. Older formats
+/// are rejected before any DDL or data changes.
 pub async fn ensure_current(conn: &Connection) -> Result<()> {
     let raw_user_version = user_version(conn).await?;
     let detected = detect_schema_version(conn).await?;
 
+    if let Some(version) = detected {
+        if version < MIN_SUPPORTED {
+            return Err(Error::SchemaVersionMismatch {
+                found: version.to_string(),
+                expected: CURRENT.to_string(),
+            });
+        }
+    }
     if raw_user_version == CURRENT.user_version() {
         validate_current_schema(conn).await?;
         ensure_current_indexes(conn).await?;
         return Ok(());
     }
+    if detected == Some(CURRENT) {
+        filesystem_identity(conn).await?;
+    }
 
     let txn = Transaction::new_unchecked(conn, TransactionBehavior::Immediate).await?;
     let result = async {
-        // Legacy overlay sidecar tables can predate columns that CURRENT_DDL
-        // indexes. Repair and backfill those columns before running any
-        // dependent CREATE INDEX statements from the single DDL list.
-        ensure_overlay_compat_columns(conn).await?;
         execute_current_ddl(conn).await?;
-        if let Some(version) = detected {
-            apply_pending_migrations(conn, version).await?;
+        if detected.is_none() {
+            conn.execute(
+                "INSERT INTO fs_config (key, value) VALUES (?, ?)",
+                (CONFIG_FILESYSTEM_ID_KEY, uuid::Uuid::new_v4().to_string()),
+            )
+            .await?;
         }
         ensure_config_defaults(conn).await?;
         if detected.is_none() {
@@ -857,155 +864,6 @@ pub(crate) async fn set_overlay_base_path(conn: &Connection, base_path: &str) ->
     Ok(())
 }
 
-async fn apply_pending_migrations(conn: &Connection, from: SchemaVersion) -> Result<()> {
-    let mut version = from;
-    while version != CURRENT {
-        let Some(migration) = MIGRATIONS
-            .iter()
-            .find(|migration| migration.from == version)
-        else {
-            return Err(Error::SchemaVersionMismatch {
-                found: version.to_string(),
-                expected: CURRENT.to_string(),
-            });
-        };
-        apply_migration(conn, migration).await?;
-        set_user_version(conn, migration.to).await?;
-        version = migration.to;
-    }
-    Ok(())
-}
-
-async fn apply_migration(conn: &Connection, migration: &Migration) -> Result<()> {
-    match (migration.from, migration.to) {
-        (SchemaVersion::V0_0, SchemaVersion::V0_2) => {
-            add_column_idempotent(
-                conn,
-                ColumnSpec {
-                    table_name: "fs_inode",
-                    column_name: "nlink",
-                    type_name: "INTEGER",
-                    not_null: true,
-                    default_value: Some("0"),
-                },
-                "ALTER TABLE fs_inode ADD COLUMN nlink INTEGER NOT NULL DEFAULT 0",
-            )
-            .await?;
-            conn.execute(
-                "UPDATE fs_inode
-                 SET nlink = CASE
-                     WHEN ino = 1 THEN 2
-                     WHEN (mode & 61440) = 16384 THEN MAX(1, (SELECT COUNT(*) FROM fs_dentry d WHERE d.ino = fs_inode.ino))
-                     ELSE (SELECT COUNT(*) FROM fs_dentry d WHERE d.ino = fs_inode.ino)
-                 END",
-                (),
-            )
-            .await?;
-            Ok(())
-        }
-        (SchemaVersion::V0_2, SchemaVersion::V0_4) => {
-            add_column_idempotent(
-                conn,
-                ColumnSpec {
-                    table_name: "fs_inode",
-                    column_name: "atime_nsec",
-                    type_name: "INTEGER",
-                    not_null: true,
-                    default_value: Some("0"),
-                },
-                "ALTER TABLE fs_inode ADD COLUMN atime_nsec INTEGER NOT NULL DEFAULT 0",
-            )
-            .await?;
-            add_column_idempotent(
-                conn,
-                ColumnSpec {
-                    table_name: "fs_inode",
-                    column_name: "mtime_nsec",
-                    type_name: "INTEGER",
-                    not_null: true,
-                    default_value: Some("0"),
-                },
-                "ALTER TABLE fs_inode ADD COLUMN mtime_nsec INTEGER NOT NULL DEFAULT 0",
-            )
-            .await?;
-            add_column_idempotent(
-                conn,
-                ColumnSpec {
-                    table_name: "fs_inode",
-                    column_name: "ctime_nsec",
-                    type_name: "INTEGER",
-                    not_null: true,
-                    default_value: Some("0"),
-                },
-                "ALTER TABLE fs_inode ADD COLUMN ctime_nsec INTEGER NOT NULL DEFAULT 0",
-            )
-            .await?;
-            add_column_idempotent(
-                conn,
-                ColumnSpec {
-                    table_name: "fs_inode",
-                    column_name: "rdev",
-                    type_name: "INTEGER",
-                    not_null: true,
-                    default_value: Some("0"),
-                },
-                "ALTER TABLE fs_inode ADD COLUMN rdev INTEGER NOT NULL DEFAULT 0",
-            )
-            .await
-        }
-        (SchemaVersion::V0_4, SchemaVersion::V0_5) => {
-            add_column_idempotent(
-                conn,
-                ColumnSpec {
-                    table_name: "fs_inode",
-                    column_name: "data_inline",
-                    type_name: "BLOB",
-                    not_null: false,
-                    default_value: None,
-                },
-                "ALTER TABLE fs_inode ADD COLUMN data_inline BLOB",
-            )
-            .await?;
-            add_column_idempotent(
-                conn,
-                ColumnSpec {
-                    table_name: "fs_inode",
-                    column_name: "storage_kind",
-                    type_name: "INTEGER",
-                    not_null: true,
-                    default_value: Some("0"),
-                },
-                "ALTER TABLE fs_inode ADD COLUMN storage_kind INTEGER NOT NULL DEFAULT 0",
-            )
-            .await
-        }
-        (SchemaVersion::V0_5, SchemaVersion::V0_6) => Ok(()),
-        (SchemaVersion::V0_6, SchemaVersion::V0_7) => {
-            migrate_chunks_to_content_addressed_storage(conn).await
-        }
-        (SchemaVersion::V0_7, SchemaVersion::V0_8) => migrate_history_to_row_deltas(conn).await,
-        _ => Err(Error::Internal(format!(
-            "unsupported schema migration {} -> {}",
-            migration.from, migration.to
-        ))),
-    }
-}
-
-async fn migrate_history_to_row_deltas(conn: &Connection) -> Result<()> {
-    // v0.7's semantic journal and its pin table are not replayable; v0.8
-    // derives history-referenced digests from the row deltas themselves. Only
-    // a genuine v0.7 source carries the pin table — a database migrating up
-    // the chain from an older version never had it.
-    if table_exists(conn, "fs_journal_chunk").await? {
-        conn.execute("DROP TABLE fs_journal_chunk", ()).await?;
-    }
-    conn.execute("DROP TABLE fs_op_journal", ()).await?;
-    conn.execute(ddl::JOURNAL_V2_DDL, ()).await?;
-    initialize_history_markers(conn).await?;
-    capture_root_raw(conn, "migrate", 1, 0).await?;
-    Ok(())
-}
-
 async fn execute_current_ddl(conn: &Connection) -> Result<()> {
     for sql in ddl::create_all(CURRENT) {
         conn.execute(*sql, ()).await?;
@@ -1027,178 +885,6 @@ async fn ensure_current_indexes(conn: &Connection) -> Result<()> {
         (),
     )
     .await?;
-    // Databases created while v0.8 still carried the journal pin table and
-    // txn_id index (never in a released binary) shed them here.
-    if table_exists(conn, "fs_journal_chunk").await? {
-        conn.execute("DROP TABLE fs_journal_chunk", ()).await?;
-    }
-    let mut rows = conn
-        .query(
-            "SELECT 1 FROM sqlite_master
-             WHERE type = 'index' AND name = 'idx_fs_op_journal_txn_id'",
-            (),
-        )
-        .await?;
-    let stale_index = rows.next().await?.is_some();
-    drop(rows);
-    if stale_index {
-        conn.execute("DROP INDEX idx_fs_op_journal_txn_id", ())
-            .await?;
-    }
-    Ok(())
-}
-
-async fn migrate_chunks_to_content_addressed_storage(conn: &Connection) -> Result<()> {
-    let has_data = column_exists(conn, "fs_data", "data").await?;
-    if !has_data {
-        ensure_column_matches(
-            conn,
-            ColumnSpec {
-                table_name: "fs_data",
-                column_name: "digest",
-                type_name: "BLOB",
-                not_null: true,
-                default_value: None,
-            },
-        )
-        .await?;
-        return Ok(());
-    }
-
-    add_column_idempotent(
-        conn,
-        ColumnSpec {
-            table_name: "fs_data",
-            column_name: "digest",
-            type_name: "BLOB",
-            not_null: false,
-            default_value: None,
-        },
-        "ALTER TABLE fs_data ADD COLUMN digest BLOB",
-    )
-    .await?;
-
-    let mut rows = conn
-        .query(
-            "SELECT ino, chunk_index, data
-             FROM fs_data
-             WHERE digest IS NULL
-             ORDER BY ino, chunk_index",
-            (),
-        )
-        .await?;
-    let mut pending = Vec::new();
-    while let Some(row) = rows.next().await? {
-        let ino: i64 = row.get(0)?;
-        let chunk_index: i64 = row.get(1)?;
-        let data: Vec<u8> = row.get(2)?;
-        pending.push((ino, chunk_index, data));
-    }
-    drop(rows);
-
-    for (ino, chunk_index, data) in pending {
-        let digest = blake3::hash(&data).as_bytes().to_vec();
-        conn.execute(
-            "INSERT INTO fs_chunk (digest, data, refcount)
-             VALUES (?, ?, 1)
-             ON CONFLICT(digest) DO UPDATE SET refcount = refcount + 1",
-            (Value::Blob(digest.clone()), Value::Blob(data)),
-        )
-        .await?;
-        conn.execute(
-            "UPDATE fs_data SET digest = ? WHERE ino = ? AND chunk_index = ?",
-            (Value::Blob(digest), ino, chunk_index),
-        )
-        .await?;
-    }
-
-    // Rebuild instead of relying on DROP COLUMN so the backfilled digest
-    // column becomes NOT NULL in the same transaction.
-    conn.execute(
-        "CREATE TABLE fs_data_v7 (
-            ino INTEGER NOT NULL,
-            chunk_index INTEGER NOT NULL,
-            digest BLOB NOT NULL,
-            PRIMARY KEY (ino, chunk_index)
-        )",
-        (),
-    )
-    .await?;
-    conn.execute(
-        "INSERT INTO fs_data_v7 (ino, chunk_index, digest)
-         SELECT ino, chunk_index, digest FROM fs_data",
-        (),
-    )
-    .await?;
-    conn.execute("DROP TABLE fs_data", ()).await?;
-    conn.execute("ALTER TABLE fs_data_v7 RENAME TO fs_data", ())
-        .await?;
-    Ok(())
-}
-
-async fn ensure_overlay_compat_columns(conn: &Connection) -> Result<()> {
-    if table_exists(conn, "fs_partial_origin").await? {
-        add_column_if_missing(
-            conn,
-            "fs_partial_origin",
-            "base_fingerprint_size",
-            "ALTER TABLE fs_partial_origin ADD COLUMN base_fingerprint_size INTEGER NOT NULL DEFAULT -1",
-        )
-        .await?;
-        add_column_if_missing(
-            conn,
-            "fs_partial_origin",
-            "base_mtime",
-            "ALTER TABLE fs_partial_origin ADD COLUMN base_mtime INTEGER NOT NULL DEFAULT 0",
-        )
-        .await?;
-        add_column_if_missing(
-            conn,
-            "fs_partial_origin",
-            "base_mtime_nsec",
-            "ALTER TABLE fs_partial_origin ADD COLUMN base_mtime_nsec INTEGER NOT NULL DEFAULT 0",
-        )
-        .await?;
-        add_column_if_missing(
-            conn,
-            "fs_partial_origin",
-            "base_ctime",
-            "ALTER TABLE fs_partial_origin ADD COLUMN base_ctime INTEGER NOT NULL DEFAULT 0",
-        )
-        .await?;
-        add_column_if_missing(
-            conn,
-            "fs_partial_origin",
-            "base_ctime_nsec",
-            "ALTER TABLE fs_partial_origin ADD COLUMN base_ctime_nsec INTEGER NOT NULL DEFAULT 0",
-        )
-        .await?;
-    }
-
-    if table_exists(conn, "fs_whiteout").await?
-        && add_column_if_missing(
-            conn,
-            "fs_whiteout",
-            "parent_path",
-            "ALTER TABLE fs_whiteout ADD COLUMN parent_path TEXT NOT NULL DEFAULT '/'",
-        )
-        .await?
-    {
-        let mut rows = conn.query("SELECT path FROM fs_whiteout", ()).await?;
-        let mut paths = Vec::new();
-        while let Some(row) = rows.next().await? {
-            let path: String = row.get(0)?;
-            paths.push(path);
-        }
-        for path in paths {
-            conn.execute(
-                "UPDATE fs_whiteout SET parent_path = ? WHERE path = ?",
-                (parent_path_for_whiteout(&path), path),
-            )
-            .await?;
-        }
-    }
-
     Ok(())
 }
 
@@ -1385,8 +1071,8 @@ pub async fn capture_root_raw(
     )
     .await?;
     conn.execute(
-        "INSERT INTO fs_snapshot_origin (snapshot_id, delta_ino, base_ino)
-         SELECT ?, delta_ino, base_ino FROM fs_origin",
+        "INSERT INTO fs_snapshot_origin (snapshot_id, delta_ino, base_identity)
+         SELECT ?, delta_ino, base_identity FROM fs_origin",
         (snapshot_id,),
     )
     .await?;
@@ -1544,36 +1230,6 @@ async fn read_config_value(conn: &Connection, key: &str) -> Result<Option<String
     }
 }
 
-async fn add_column_if_missing(
-    conn: &Connection,
-    table_name: &str,
-    column_name: &str,
-    sql: &str,
-) -> Result<bool> {
-    if column_exists(conn, table_name, column_name).await? {
-        return Ok(false);
-    }
-    conn.execute(sql, ()).await?;
-    Ok(true)
-}
-
-async fn column_exists(conn: &Connection, table_name: &str, column_name: &str) -> Result<bool> {
-    Ok(get_table_columns(conn, table_name)
-        .await?
-        .iter()
-        .any(|column| column.name == column_name))
-}
-
-fn parent_path_for_whiteout(path: &str) -> String {
-    if path == "/" {
-        return "/".to_string();
-    }
-    match path.rsplit_once('/') {
-        Some(("", _)) | None => "/".to_string(),
-        Some((parent, _)) => parent.to_string(),
-    }
-}
-
 async fn validate_current_schema(conn: &Connection) -> Result<()> {
     for table in REQUIRED_CURRENT_TABLES {
         if !table_exists(conn, table).await? {
@@ -1587,7 +1243,27 @@ async fn validate_current_schema(conn: &Connection) -> Result<()> {
         ensure_column_matches(conn, *spec).await?;
     }
 
+    filesystem_identity(conn).await?;
+
     Ok(())
+}
+
+/// Immutable creation namespace; never default missing or corrupt persisted identity.
+pub(crate) async fn filesystem_identity(conn: &Connection) -> Result<String> {
+    let value = read_config_value(conn, CONFIG_FILESYSTEM_ID_KEY)
+        .await?
+        .ok_or_else(|| Error::Internal("current schema is missing filesystem_id".into()))?;
+    if !valid_filesystem_identity(&value) {
+        return Err(Error::Internal(format!(
+            "invalid filesystem_id {value:?}: expected canonical UUID v4"
+        )));
+    }
+    Ok(value)
+}
+
+pub(crate) fn valid_filesystem_identity(value: &str) -> bool {
+    uuid::Uuid::parse_str(value)
+        .is_ok_and(|id| id.get_version_num() == 4 && id.to_string() == value)
 }
 
 async fn user_version(conn: &Connection) -> Result<i64> {
@@ -1645,17 +1321,6 @@ async fn get_table_columns(conn: &Connection, table_name: &str) -> Result<Vec<Co
     Ok(columns)
 }
 
-async fn add_column_idempotent(conn: &Connection, spec: ColumnSpec, sql: &str) -> Result<()> {
-    match conn.execute(sql, ()).await {
-        Ok(_) => Ok(()),
-        Err(err) if is_duplicate_column_error(&err) => ensure_column_matches(conn, spec).await,
-        Err(err) => Err(Error::Internal(format!(
-            "schema ALTER failed while adding {}.{}: {err}",
-            spec.table_name, spec.column_name
-        ))),
-    }
-}
-
 async fn ensure_column_matches(conn: &Connection, spec: ColumnSpec) -> Result<()> {
     let columns = get_table_columns(conn, spec.table_name).await?;
     for column in columns {
@@ -1690,18 +1355,12 @@ async fn ensure_column_matches(conn: &Connection, spec: ColumnSpec) -> Result<()
     )))
 }
 
-fn is_duplicate_column_error(err: &turso::Error) -> bool {
-    err.to_string()
-        .to_ascii_lowercase()
-        .contains("duplicate column")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{KvStore, ToolCalls, Vfs, VfsOptions, DEFAULT_FILE_MODE};
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -2369,29 +2028,6 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn migration_preserves_hollow_marker() -> Result<()> {
-        let dir = tempdir()?;
-        let db_path = dir.path().join("hollow-migration.db");
-        let db = Builder::new_local(db_path.to_str().unwrap())
-            .build()
-            .await?;
-        let conn = db.connect()?;
-        create_legacy_fixture(&conn, SchemaVersion::V0_7).await?;
-        hollow_chunks(&conn).await?;
-        assert!(chunks_hollow(&conn).await?);
-
-        ensure_current(&conn).await?;
-
-        assert_eq!(detect_schema_version(&conn).await?, Some(CURRENT));
-        assert!(chunks_hollow(&conn).await?);
-        assert!(matches!(
-            require_current(&conn, false).await.unwrap_err(),
-            Error::ChunksHollow
-        ));
-        Ok(())
-    }
-
     async fn chunk_rows(conn: &Connection) -> Result<Vec<([u8; 32], Vec<u8>, i64)>> {
         let mut rows = conn
             .query(
@@ -2410,112 +2046,6 @@ mod tests {
             ));
         }
         Ok(chunks)
-    }
-
-    #[tokio::test]
-    async fn schema_user_version_migrations_from_all_fixtures() -> Result<()> {
-        for version in [
-            SchemaVersion::V0_0,
-            SchemaVersion::V0_2,
-            SchemaVersion::V0_4,
-            SchemaVersion::V0_5,
-            SchemaVersion::V0_6,
-            SchemaVersion::V0_7,
-        ] {
-            let dir = tempdir()?;
-            let db_path = dir.path().join(format!("fixture-{}.db", version.as_str()));
-            let db = Builder::new_local(db_path.to_str().unwrap())
-                .build()
-                .await?;
-            let conn = db.connect()?;
-            create_legacy_fixture(&conn, version).await?;
-
-            let kv_before = scalar_i64(&conn, "SELECT COUNT(*) FROM kv_store").await?;
-            let tool_before = scalar_i64(&conn, "SELECT COUNT(*) FROM tool_calls").await?;
-            let data_before = read_fixture_file_bytes(&conn).await?;
-
-            ensure_current(&conn).await?;
-
-            assert_eq!(user_version(&conn).await?, CURRENT.user_version());
-            assert_eq!(detect_schema_version(&conn).await?, Some(CURRENT));
-            assert_eq!(
-                kv_before,
-                scalar_i64(&conn, "SELECT COUNT(*) FROM kv_store").await?
-            );
-            assert_eq!(
-                tool_before,
-                scalar_i64(&conn, "SELECT COUNT(*) FROM tool_calls").await?
-            );
-            assert_eq!(data_before, read_fixture_file_bytes(&conn).await?);
-            assert_chunk_refcounts_exact(&conn).await?;
-            assert_eq!(
-                scalar_i64(&conn, "SELECT MAX(refcount) FROM fs_chunk").await?,
-                2,
-                "duplicate fixture chunks should share one CAS row"
-            );
-            assert_eq!(
-                scalar_i64(
-                    &conn,
-                    "SELECT COUNT(*) FROM fs_snapshot
-                     WHERE reason = 'migrate' AND history_epoch = 1 AND through_seq = 0",
-                )
-                .await?,
-                1,
-                "migration must establish one replay root"
-            );
-            assert_eq!(
-                scalar_i64(&conn, "SELECT COUNT(*) FROM fs_op_journal").await?,
-                0,
-                "pre-v0.8 journal history must not survive migration"
-            );
-
-            drop(conn);
-            drop(db);
-            let agent = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await?;
-            assert_eq!(agent.fs.read_file("/file.txt").await?.unwrap(), b"abcdef");
-            let conn = agent.get_connection().await?;
-            let report =
-                integrity::check(&conn, &integrity::CheckOpts::new(db_path.clone())).await?;
-            assert!(report.ok, "integrity failed for migrated {version}");
-        }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn migrated_defaults_keep_inline_threshold_within_chunk_size() -> Result<()> {
-        let dir = tempdir()?;
-        let db_path = dir.path().join("legacy-small-chunks.db");
-        let db = Builder::new_local(db_path.to_str().unwrap())
-            .build()
-            .await?;
-        let conn = db.connect()?;
-        create_legacy_fixture(&conn, SchemaVersion::V0_4).await?;
-        conn.execute(
-            "DELETE FROM fs_config WHERE key = ?",
-            (CONFIG_INLINE_THRESHOLD_KEY,),
-        )
-        .await?;
-        conn.execute(
-            "UPDATE fs_config SET value = '4096' WHERE key = ?",
-            (CONFIG_CHUNK_SIZE_KEY,),
-        )
-        .await?;
-
-        ensure_current(&conn).await?;
-
-        let inline_threshold = read_config_value(&conn, CONFIG_INLINE_THRESHOLD_KEY)
-            .await?
-            .expect("inline_threshold default must be inserted");
-        assert_eq!(inline_threshold, "4096");
-        let report = integrity::check(&conn, &integrity::CheckOpts::new(db_path.clone())).await?;
-        let failing = report
-            .checks
-            .iter()
-            .filter(|check| !check.ok)
-            .map(|check| check.name.clone())
-            .collect::<Vec<_>>();
-        assert!(report.ok, "integrity failed: {failing:?}");
-        Ok(())
     }
 
     #[tokio::test]
@@ -2638,43 +2168,14 @@ mod tests {
                 );
             }
 
-            ensure_current(&conn).await?;
-            drop(conn);
-            drop(db);
-            let agent = Vfs::open(VfsOptions::with_path(db_path.to_string_lossy())).await?;
-            assert_eq!(agent.fs.read_file("/file.txt").await?.unwrap(), b"abcdef");
+            let before = read_fixture_file_bytes(&conn).await?;
+            assert!(matches!(
+                ensure_current(&conn).await,
+                Err(Error::SchemaVersionMismatch { .. })
+            ));
+            assert_eq!(user_version(&conn).await?, 0);
+            assert_eq!(before, read_fixture_file_bytes(&conn).await?);
         }
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn legacy_whiteout_without_parent_path_migrates_for_sdk_openers() -> Result<()> {
-        let dir = tempdir()?;
-
-        let agent_path =
-            create_legacy_whiteout_fixture_file(dir.path(), "agent-open", SchemaVersion::V0_6)
-                .await?;
-        let agent = Vfs::open(VfsOptions::with_path(agent_path.to_string_lossy())).await?;
-        assert_eq!(agent.fs.read_file("/file.txt").await?.unwrap(), b"abcdef");
-        drop(agent);
-        assert_legacy_whiteout_parent_path(&agent_path, "Vfs::open").await?;
-
-        let kv_path =
-            create_legacy_whiteout_fixture_file(dir.path(), "kv-open", SchemaVersion::V0_6).await?;
-        let kv = KvStore::new(kv_path.to_str().unwrap()).await?;
-        kv.set("after", &serde_json::json!({ "ok": true })).await?;
-        drop(kv);
-        assert_legacy_whiteout_parent_path(&kv_path, "KvStore::new").await?;
-
-        let tool_path =
-            create_legacy_whiteout_fixture_file(dir.path(), "tool-open", SchemaVersion::V0_6)
-                .await?;
-        let tools = ToolCalls::new(tool_path.to_str().unwrap()).await?;
-        let id = tools.start("after", None).await?;
-        tools.success(id, None).await?;
-        drop(tools);
-        assert_legacy_whiteout_parent_path(&tool_path, "ToolCalls::new").await?;
-
         Ok(())
     }
 
@@ -2713,10 +2214,14 @@ mod tests {
             (CONFIG_SCHEMA_VERSION_KEY,),
         )
         .await?;
-        ensure_current(&conn).await?;
-        assert_eq!(detect_schema_version(&conn).await?, Some(CURRENT));
-        let agent = Vfs::open(VfsOptions::with_path(hybrid_path.to_string_lossy())).await?;
-        assert_eq!(agent.fs.read_file("/file.txt").await?.unwrap(), b"abcdef");
+        assert!(matches!(
+            ensure_current(&conn).await,
+            Err(Error::SchemaVersionMismatch { .. })
+        ));
+        assert_eq!(
+            detect_schema_version(&conn).await?,
+            Some(SchemaVersion::V0_5)
+        );
 
         let corrupt_current_path = dir.path().join("current-missing-table.db");
         let db = Builder::new_local(corrupt_current_path.to_str().unwrap())
@@ -2733,89 +2238,6 @@ mod tests {
             "unexpected error: {err}"
         );
 
-        Ok(())
-    }
-
-    async fn create_legacy_whiteout_fixture_file(
-        dir: &Path,
-        name: &str,
-        version: SchemaVersion,
-    ) -> Result<PathBuf> {
-        let db_path = dir.join(format!("{name}.db"));
-        let db = Builder::new_local(db_path.to_str().unwrap())
-            .build()
-            .await?;
-        let conn = db.connect()?;
-        create_legacy_fixture(&conn, version).await?;
-        ensure_current(&conn).await?;
-        add_legacy_whiteout_without_parent_path(&conn).await?;
-        set_user_version(&conn, SchemaVersion::V0_0).await?;
-        drop(conn);
-        drop(db);
-        Ok(db_path)
-    }
-
-    async fn add_legacy_whiteout_without_parent_path(conn: &Connection) -> Result<()> {
-        conn.execute("DROP TABLE IF EXISTS fs_whiteout", ()).await?;
-        conn.execute(
-            "CREATE TABLE fs_whiteout (
-                path TEXT PRIMARY KEY,
-                created_at INTEGER NOT NULL
-            )",
-            (),
-        )
-        .await?;
-        conn.execute(
-            "INSERT INTO fs_whiteout (path, created_at) VALUES
-             ('/dir/deleted', 123),
-             ('/top-level', 456)",
-            (),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn assert_legacy_whiteout_parent_path(db_path: &Path, label: &str) -> Result<()> {
-        let db = Builder::new_local(db_path.to_str().unwrap())
-            .build()
-            .await?;
-        let conn = db.connect()?;
-
-        let column_names = get_table_columns(&conn, "fs_whiteout")
-            .await?
-            .into_iter()
-            .map(|column| column.name)
-            .collect::<Vec<_>>();
-        assert!(
-            column_names.iter().any(|column| column == "parent_path"),
-            "{label} did not add fs_whiteout.parent_path; columns={column_names:?}"
-        );
-
-        let mut rows = conn
-            .query(
-                "SELECT path, parent_path, created_at
-                 FROM fs_whiteout
-                 ORDER BY path",
-                (),
-            )
-            .await?;
-        let mut migrated = Vec::new();
-        while let Some(row) = rows.next().await? {
-            migrated.push((
-                row.get::<String>(0)?,
-                row.get::<String>(1)?,
-                row.get::<i64>(2)?,
-            ));
-        }
-        println!("{label}: fs_whiteout columns={column_names:?}; rows={migrated:?}");
-        assert_eq!(
-            migrated,
-            vec![
-                ("/dir/deleted".to_string(), "/dir".to_string(), 123),
-                ("/top-level".to_string(), "/".to_string(), 456),
-            ]
-        );
-        assert_eq!(user_version(&conn).await?, CURRENT.user_version());
         Ok(())
     }
 
@@ -3100,7 +2522,11 @@ mod tests {
     }
 
     async fn read_fixture_file_bytes(conn: &Connection) -> Result<Vec<u8>> {
-        let sql = if column_exists(conn, "fs_data", "data").await? {
+        let sql = if get_table_columns(conn, "fs_data")
+            .await?
+            .iter()
+            .any(|c| c.name == "data")
+        {
             "SELECT data FROM fs_data WHERE ino = 2 ORDER BY chunk_index"
         } else {
             "SELECT c.data
@@ -3122,20 +2548,6 @@ mod tests {
             }
         }
         Ok(bytes)
-    }
-
-    async fn assert_chunk_refcounts_exact(conn: &Connection) -> Result<()> {
-        let mismatches = scalar_i64(
-            conn,
-            "SELECT COUNT(*)
-             FROM fs_chunk c
-             WHERE c.refcount != (
-                 SELECT COUNT(*) FROM fs_data d WHERE d.digest = c.digest
-             )",
-        )
-        .await?;
-        assert_eq!(mismatches, 0, "CAS refcounts must match live mappings");
-        Ok(())
     }
 
     async fn scalar_i64(conn: &Connection, sql: &str) -> Result<i64> {

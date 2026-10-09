@@ -1,6 +1,6 @@
 use super::{OverlayFS, ROOT_INO};
 use crate::error::Result;
-use crate::fs::FsError;
+use crate::fs::{FileSystem, FsError};
 use std::collections::HashMap;
 use turso::Connection;
 
@@ -24,7 +24,7 @@ pub(super) struct InodeInfo {
     has_extra_reverse: bool,
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct OverlayMapCounts {
     pub(super) inode_entries: usize,
@@ -187,7 +187,7 @@ impl OverlayMaps {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn counts(&self) -> OverlayMapCounts {
         OverlayMapCounts {
             inode_entries: self.inode.len(),
@@ -227,13 +227,6 @@ impl OverlayFS {
         self.maps.lock().inode.get(&ino).cloned()
     }
 
-    pub(super) fn live_origin_overlay_ino(&self, base_ino: i64, path: &str) -> Option<i64> {
-        let maps = self.maps.lock();
-        let overlay_ino = maps.reverse.get(&(Layer::Base, base_ino)).copied()?;
-        let info = maps.inode.get(&overlay_ino)?;
-        (info.path == path).then_some(overlay_ino)
-    }
-
     /// Build path from parent inode and name.
     pub(super) fn build_path(&self, parent_ino: i64, name: &str) -> Result<String> {
         let info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
@@ -244,38 +237,55 @@ impl OverlayFS {
         })
     }
 
-    /// Store origin mapping for copy-up
+    /// Persist the native base identity through the existing origin journal.
     pub(super) async fn add_origin_mapping(&self, delta_ino: i64, base_ino: i64) -> Result<()> {
+        let identity = self.base.file_identity(base_ino)?;
         let conn = self.delta.get_connection().await?;
         let mut txn =
             super::super::vfs::MutationTxn::begin(&conn, self.delta.journal_ctx()).await?;
-        Self::add_origin_mapping_with_conn(txn.conn(), delta_ino, base_ino).await?;
+        Self::add_origin_mapping_with_conn(txn.conn(), delta_ino, &identity).await?;
         txn.record(super::super::vfs::JournalDelta::origin_upsert(
             "origin_map",
             delta_ino,
-            base_ino,
+            &identity,
         ));
         txn.commit().await?;
-        self.origin_map.write().insert(delta_ino, base_ino);
+        self.origin_map.write().insert(identity, delta_ino);
         Ok(())
     }
 
     pub(super) async fn add_origin_mapping_with_conn(
         conn: &Connection,
         delta_ino: i64,
-        base_ino: i64,
+        identity: &str,
     ) -> Result<()> {
         conn.execute(
-            "INSERT OR REPLACE INTO fs_origin (delta_ino, base_ino) VALUES (?, ?)",
-            (delta_ino, base_ino),
+            "INSERT INTO fs_origin (delta_ino,base_identity) VALUES (?,?)",
+            (delta_ino, identity),
         )
         .await?;
         Ok(())
     }
 
-    /// Get origin inode for a delta inode
-    pub(super) fn get_origin_ino(&self, delta_ino: i64) -> Option<i64> {
-        self.origin_map.read().get(&delta_ino).copied()
+    /// Resolve a visited base object to its private version without scanning paths.
+    pub(super) async fn stats_for_base(
+        &self,
+        stats: crate::fs::Stats,
+        path: &str,
+    ) -> Result<crate::fs::Stats> {
+        let identity = self.base.file_identity(stats.ino)?;
+        let private = self.origin_map.read().get(&identity).copied();
+        if let Some(delta_ino) = private {
+            let mut private_stats =
+                self.delta.getattr(delta_ino).await?.ok_or_else(|| {
+                    FsError::Corrupt("origin points to missing delta inode".into())
+                })?;
+            private_stats.ino = self.get_or_create_overlay_ino(Layer::Delta, delta_ino, path);
+            Ok(private_stats)
+        } else {
+            let ino = self.get_or_create_overlay_ino(Layer::Base, stats.ino, path);
+            Ok(crate::fs::Stats { ino, ..stats })
+        }
     }
 
     pub(super) fn promote_mapping_to_delta(&self, path: &str, delta_ino: i64) {
@@ -290,7 +300,7 @@ impl OverlayFS {
         self.maps.lock().forget_lookup(ino, nlookup);
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn debug_map_counts(&self) -> OverlayMapCounts {
         self.maps.lock().counts()
     }

@@ -51,7 +51,7 @@ pub use config::{
     DEFAULT_WRITE_BATCH_BYTES, DEFAULT_WRITE_BATCH_GLOBAL_BYTES, DEFAULT_WRITE_BATCH_MS,
     DEFAULT_WRITE_BATCH_TXN_BYTES, DEFAULT_WRITE_BATCH_TXN_INODES,
 };
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(any(target_os = "linux", target_os = "macos", windows))]
 pub use fs::HostFS;
 pub use fs::{
     journal_gc, BoxedFile, DirEntry, File, FileSystem, FilesystemStats, FsError, HistoryStatus,
@@ -841,7 +841,7 @@ mod tests {
             std::path::Path::new(&by_path).is_absolute(),
             "with_path must absolutize: {by_path}"
         );
-        assert!(by_path.ends_with("/some-dir/relative.db"));
+        assert!(std::path::Path::new(&by_path).ends_with("some-dir/relative.db"));
 
         let by_id = VfsOptions::with_id("db-path-absolute-test")
             .db_path()
@@ -850,7 +850,7 @@ mod tests {
             std::path::Path::new(&by_id).is_absolute(),
             "with_id must absolutize: {by_id}"
         );
-        assert!(by_id.ends_with("/.vfs/db-path-absolute-test.db"));
+        assert!(std::path::Path::new(&by_id).ends_with(".vfs/db-path-absolute-test.db"));
 
         assert_eq!(VfsOptions::ephemeral().db_path().unwrap(), ":memory:");
         assert_eq!(

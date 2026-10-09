@@ -213,12 +213,12 @@ impl JournalDelta {
         Self::new(label, "fs_whiteout", "delete", json!({ "path": path }))
     }
 
-    pub(crate) fn origin_upsert(label: &'static str, delta_ino: i64, base_ino: i64) -> Self {
+    pub(crate) fn origin_upsert(label: &'static str, delta_ino: i64, base_identity: &str) -> Self {
         Self::new(
             label,
             "fs_origin",
             "upsert",
-            json!({ "delta_ino": delta_ino, "base_ino": base_ino }),
+            json!({ "delta_ino": delta_ino, "base_identity": base_identity }),
         )
     }
 

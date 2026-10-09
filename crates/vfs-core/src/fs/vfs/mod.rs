@@ -137,6 +137,7 @@ pub struct Vfs {
     pool: ConnectionPool,
     db_path: Option<Arc<PathBuf>>,
     read_only: bool,
+    filesystem_id: Arc<str>,
     chunk_size: usize,
     inline_threshold: usize,
     /// Cache for directory entry lookups (shared across clones)
@@ -219,6 +220,7 @@ impl Vfs {
         let db_path = std::path::absolute(db_path)?;
         let conn = pool.get_connection().await?;
         schema::check_schema_version(&conn).await?;
+        let filesystem_id = schema::filesystem_identity(&conn).await?;
 
         let chunk_size = Self::read_chunk_size(&conn).await?;
         let inline_threshold = Self::read_inline_threshold(&conn).await?;
@@ -233,6 +235,7 @@ impl Vfs {
             pool,
             db_path: Some(Arc::new(db_path)),
             read_only: true,
+            filesystem_id: Arc::from(filesystem_id),
             chunk_size,
             inline_threshold,
             dentry_cache: Arc::new(DentryCache::new(DENTRY_CACHE_MAX_SIZE)),
@@ -272,6 +275,7 @@ impl Vfs {
         let journal = journal::JournalCtx::new(config.journal_enabled);
         let hollow =
             Self::initialize_schema(&conn, journal.clone(), chunk_source.is_some()).await?;
+        let filesystem_id = schema::filesystem_identity(&conn).await?;
         super::history::reconcile_epoch(&conn, config.journal_enabled).await?;
 
         // Get chunk_size from config (or use default)
@@ -321,6 +325,7 @@ impl Vfs {
             pool,
             db_path: db_path.map(Arc::new),
             read_only: false,
+            filesystem_id: Arc::from(filesystem_id),
             chunk_size,
             inline_threshold,
             dentry_cache: Arc::new(DentryCache::new(DENTRY_CACHE_MAX_SIZE)),
@@ -378,7 +383,7 @@ impl Vfs {
         self.lifecycle.register_reap_hook(hook)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn reap_hook_count(&self) -> usize {
         self.lifecycle.reap_hook_count()
     }

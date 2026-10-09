@@ -8,7 +8,10 @@ impl OverlayFS {
         let mut current = String::new();
         for component in path.split('/').filter(|s| !s.is_empty()) {
             current = format!("{current}/{component}");
-            if whiteouts.contains(&current) {
+            if whiteouts
+                .iter()
+                .any(|hidden| self.base.names_equal(hidden, &current))
+            {
                 return true;
             }
         }
@@ -55,9 +58,16 @@ impl OverlayFS {
 
     /// Remove a whiteout.
     pub(super) async fn remove_whiteout(&self, path: &str) -> Result<()> {
-        if !self.whiteouts.read().contains(path) {
+        let matched = self
+            .whiteouts
+            .read()
+            .iter()
+            .find(|hidden| self.base.names_equal(hidden, path))
+            .cloned();
+        let Some(matched) = matched else {
             return Ok(());
-        }
+        };
+        let path = matched.as_str();
 
         let conn = self.delta.get_connection().await?;
         let mut txn =
@@ -90,36 +100,19 @@ impl OverlayFS {
     /// Get child whiteouts for a directory.
     pub(super) fn get_child_whiteouts(&self, dir_path: &str) -> HashSet<String> {
         let whiteouts = self.whiteouts.read();
-        let prefix = if dir_path == "/" {
-            "/".to_string()
-        } else {
-            format!("{dir_path}/")
-        };
         whiteouts
             .iter()
-            .filter_map(|p| {
-                if dir_path == "/" {
-                    let trimmed = p.trim_start_matches('/');
-                    if !trimmed.contains('/') {
-                        Some(trimmed.to_string())
-                    } else {
-                        None
-                    }
-                } else if p.starts_with(&prefix) {
-                    let rest = &p[prefix.len()..];
-                    if !rest.contains('/') {
-                        Some(rest.to_string())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
+            .filter_map(|path| {
+                let (parent, name) = path.rsplit_once('/').unwrap();
+                let parent = if parent.is_empty() { "/" } else { parent };
+                self.base
+                    .names_equal(parent, dir_path)
+                    .then(|| name.to_owned())
             })
             .collect()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(super) fn fail_next_whiteout_for_test(&self, reason: &str) {
         *self.whiteout_fault.lock() = Some(reason.to_string());
     }

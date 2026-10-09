@@ -240,7 +240,9 @@ no_sidecars "integrity --json"
 run_vfs migrate "$RDB" >/dev/null 2>&1 || fail "migrate already-current (read census) failed"
 no_sidecars "migrate (already current)"
 cp "$DIR/fixtures/migrate/v0_4.db" "$ROOT/dry-run.db"
-run_vfs migrate "$ROOT/dry-run.db" --dry-run >/dev/null 2>&1 || fail "migrate --dry-run failed"
+if run_vfs migrate "$ROOT/dry-run.db" --dry-run >/dev/null 2>&1; then
+    fail "dry-run accepted an unsupported old schema"
+fi
 [ ! -e "$ROOT/dry-run.db-wal" ] || fail "migrate --dry-run left $ROOT/dry-run.db-wal behind"
 [ ! -e "$ROOT/dry-run.db-shm" ] || fail "migrate --dry-run left $ROOT/dry-run.db-shm behind"
 run_vfs ps >/dev/null 2>&1 || fail "ps (read census) failed"
@@ -258,10 +260,11 @@ grep -q "exec-census-ok" "$ROOT/exec-census.log" || fail "exec (census) output m
 
 # --- migrate a committed old-schema fixture ----------------------------------------------
 cp "$DIR/fixtures/migrate/v0_4.db" "$ROOT/old.db"
-run_vfs migrate "$ROOT/old.db" >"$ROOT/migrate.log" 2>&1 ||
-    fail "migrate failed: $(cat "$ROOT/migrate.log")"
-run_vfs integrity --json "$ROOT/old.db" >/dev/null 2>&1 ||
-    fail "integrity on migrated fixture failed"
+if run_vfs migrate "$ROOT/old.db" >"$ROOT/migrate.log" 2>&1; then
+    fail "migrate accepted an unsupported old schema"
+fi
+grep -q 'automatic migration is unavailable' "$ROOT/migrate.log" ||
+    fail "old-schema refusal omitted its reason"
 
 # Regression: a nonexistent path-shaped argument must report a missing
 # database, not "invalid agent ID".

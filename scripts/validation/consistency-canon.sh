@@ -73,14 +73,14 @@ from pathlib import Path
 
 problems = []
 
-fuse = Path("crates/vfs-fuse/src/lib.rs").read_text()
+fuse = Path("crates/vfs-fuse/src/lib.rs").read_text(encoding="utf-8")
 fuse_pubs = re.findall(r"^pub .*$", fuse, re.M)
 if fuse_pubs != ["pub use adapter::{mount, FuseMountOptions, SessionHandle};"]:
     problems.append(f"fuse lib.rs pub surface drifted: {fuse_pubs}")
 if re.search(r"^pub mod", fuse, re.M):
     problems.append("fuse lib.rs exposes a pub mod")
 
-nfs = Path("crates/vfs-nfs/src/lib.rs").read_text()
+nfs = Path("crates/vfs-nfs/src/lib.rs").read_text(encoding="utf-8")
 nfs_items = re.findall(r"^pub (?:async )?(?:struct|fn|enum|trait|mod|use) (\w+)", nfs, re.M)
 if sorted(nfs_items) != ["NfsServeOptions", "ServerHandle", "serve"]:
     problems.append(f"nfs lib.rs pub surface drifted: {sorted(nfs_items)}")
@@ -100,7 +100,7 @@ import re
 def nontest_lines(path):
     '''Yield (lineno, line) for lines outside cfg(test)/cfg(all(test, ..))
     module blocks, tracked by brace depth from the attribute.'''
-    lines = path.read_text(errors='replace').splitlines()
+    lines = path.read_text(encoding='utf-8').splitlines()
     in_test = False
     depth = 0
     pending_attr = False
@@ -168,7 +168,7 @@ exec(os.environ["CANON_SCAN_HELPER"])
 # eprintln!/println! are user-facing CLI output only: cmd/, the single
 # reporter in main.rs, plus build scripts (canon section 7 item 2).
 def allowed(path):
-    p = str(path)
+    p = path.as_posix()
     return (
         p.startswith("crates/vfs-cli/src/cmd/")
         or p == "crates/vfs-cli/src/main.rs"
@@ -208,9 +208,9 @@ ALLOWED_PREFIXES = (
 offenders = []
 for path in sorted(Path("crates").rglob("*.rs")):
     parts = path.parts
-    if "target" in parts or path.name == "tests.rs" or "tests" in parts:
+    if "target" in parts or path.name in ("tests.rs", "build.rs") or "tests" in parts:
         continue
-    if str(path).startswith(ALLOWED_PREFIXES):
+    if path.as_posix().startswith(ALLOWED_PREFIXES):
         continue
     for lineno, line in nontest_lines(path):
         if re.search(r"\benv::(var|var_os)\b", line):
@@ -226,7 +226,7 @@ check_python "envfilter-coverage" - <<'PY'
 import sys
 from pathlib import Path
 
-logging = Path("crates/vfs-cli/src/logging.rs").read_text()
+logging = Path("crates/vfs-cli/src/logging.rs").read_text(encoding="utf-8")
 missing = [
     target for target in
     ("vfs=", "vfs_cli=", "vfs_core=", "vfs_fuse=", "vfs_nfs=", "vfs_mount=")
@@ -243,14 +243,14 @@ check_python "await-holding-lock" - <<'PY'
 import sys
 from pathlib import Path
 
-root = Path("Cargo.toml").read_text()
+root = Path("Cargo.toml").read_text(encoding="utf-8")
 if 'await_holding_lock = "deny"' not in root:
     print("workspace lints table does not deny clippy::await_holding_lock")
     sys.exit(1)
 missing = [
     crate for crate in ("vfs-cli", "vfs-core", "vfs-fuse", "vfs-nfs", "vfs-mount")
-    if "workspace = true" not in Path(f"crates/{crate}/Cargo.toml").read_text().split("[lints]")[-1]
-    or "[lints]" not in Path(f"crates/{crate}/Cargo.toml").read_text()
+    if "workspace = true" not in Path(f"crates/{crate}/Cargo.toml").read_text(encoding="utf-8").split("[lints]")[-1]
+    or "[lints]" not in Path(f"crates/{crate}/Cargo.toml").read_text(encoding="utf-8")
 ]
 if missing:
     print(f"crates missing [lints] workspace = true: {missing}")
@@ -271,7 +271,7 @@ modules = [
 ]
 missing = [
     m for m in modules
-    if not re.search(r"lock order", Path(m).read_text(), re.I)
+    if not re.search(r"lock order", Path(m).read_text(encoding="utf-8"), re.I)
 ]
 if missing:
     print(f"multi-lock modules missing a lock-order header: {missing}")
@@ -305,7 +305,7 @@ import sys
 from pathlib import Path
 
 path = Path("CHANGELOG.md")
-if not path.is_file() or not path.read_text().strip():
+if not path.is_file() or not path.read_text(encoding="utf-8").strip():
     print("CHANGELOG.md missing or empty at repo root")
     sys.exit(1)
 print("CHANGELOG.md present at repo root")

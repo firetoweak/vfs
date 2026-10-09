@@ -87,7 +87,7 @@ where
 {
     let outcome = tokio::select! {
         result = task => result.map(SupervisedTaskOutcome::Completed),
-        signal = crate::termination_signal() => {
+        signal = super::termination_signal() => {
             signal
                 .map(SupervisedTaskOutcome::Interrupted)
                 .map_err(anyhow::Error::from)
@@ -102,7 +102,7 @@ where
 /// Wait for a foreground mount to end, then unmount through the shared path.
 pub async fn supervise_mount(handle: MountHandle) -> Result<()> {
     tokio::select! {
-        result = crate::shutdown_signal() => result.map_err(anyhow::Error::from),
+        result = super::shutdown_signal() => result.map_err(anyhow::Error::from),
         _ = async {
             loop {
                 if handle.is_finished() || !crate::is_mountpoint(handle.mountpoint()) {
@@ -129,7 +129,7 @@ pub async fn supervise_command(mut command: tokio::process::Command) -> Result<C
             }
             return Ok(ChildOutcome::Exited(status));
         },
-        signal = crate::termination_signal() => signal?,
+        signal = super::termination_signal() => signal?,
     };
 
     terminate_child(&mut child, opts.kill_process_group, signo);
@@ -327,7 +327,7 @@ async fn wait_for_supervised_child(
 ) -> Result<ExitStatus> {
     let signo = tokio::select! {
         status = child.wait() => return Ok(status?),
-        signal = crate::termination_signal() => signal?,
+        signal = super::termination_signal() => signal?,
     };
 
     terminate_child(child, opts.kill_process_group, signo);

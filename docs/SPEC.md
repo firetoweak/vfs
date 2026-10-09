@@ -1,10 +1,10 @@
 # Agent Filesystem Specification
 
-**Version:** 0.8
+**Version:** 0.10
 
 ## Introduction
 
-The Agent Filesystem Specification defines a SQLite schema for representing agent filesystem state. The current v0.8 format stores replayable row-delta history and immutable root snapshots over the v0.7 content-addressed layout, with `user_version`-keyed migration from older databases (in place by default, or copy-based re-chunking with `--copy`). The specification consists of five main components:
+The Agent Filesystem Specification defines a SQLite schema for representing agent filesystem state. The fork's v0.10 format preserves content-addressed storage and replayable history, with persistent base identities and UUID namespaces for files born in different deltas. It accepts only v0.10 databases; older formats are refused without guessing origin ownership. The specification consists of five main components:
 
 1. **Tool Call Audit Trail**: Captures tool invocations, parameters, and results for debugging, auditing, and performance analysis
 2. **Virtual Filesystem**: Stores agent artifacts (files, documents, outputs) using a Unix-like inode design with support for hard links, proper metadata, and efficient file operations
@@ -250,7 +250,8 @@ CREATE TABLE fs_config (
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `schema_version` | On-disk schema version | `0.8` |
+| `schema_version` | On-disk schema version | `0.10` |
+| `filesystem_id` | Immutable UUID v4 creation namespace of this delta | Generated once at database creation |
 | `chunk_size` | Size of data chunks in bytes | `65536` |
 | `inline_threshold` | Maximum dense regular-file size stored inline in `fs_inode.data_inline` | `16384` |
 | `history_epoch` | Identity of the current replay lineage | `1` |
@@ -635,7 +636,7 @@ When creating a new agent database, initialize the filesystem configuration and 
 
 ```sql
 -- Initialize filesystem configuration
-INSERT INTO fs_config (key, value) VALUES ('schema_version', '0.8');
+INSERT INTO fs_config (key, value) VALUES ('schema_version', '0.10');
 INSERT INTO fs_config (key, value) VALUES ('chunk_size', '65536');
 INSERT INTO fs_config (key, value) VALUES ('inline_threshold', '16384');
 INSERT INTO fs_config (key, value) VALUES ('history_epoch', '1');
@@ -653,48 +654,23 @@ history root containing inode 1 at epoch 1 through sequence 0.
 
 **Note:** The `chunk_size` and `inline_threshold` values can be customized at filesystem creation time but MUST NOT be changed afterward. The root directory starts at `nlink=2` for its synthetic `.` and `..` references.
 
-### Schema Migration
+### Format Boundary
 
-Migrations are keyed by `PRAGMA user_version` and land any supported old
-schema (v0.0, v0.2, v0.4, v0.5, v0.6, v0.7) at the current version with one
-command:
+`PRAGMA user_version = 10` identifies this fork's baseline. `MIN_SUPPORTED` is
+0.10. Initialization, writable open and read-only open MUST refuse any older
+format before running schema DDL. Old physical or delta ownership cannot be
+recovered from ambiguous origin references. Neither in-place
+nor copy migration may fabricate identities or discard origin relationships.
+A current database with missing or incompatible identity columns is corrupt
+and MUST be refused, rather than repaired as a legacy layout.
 
-```bash
-vfs migrate <id-or-path>
-```
-
-In-place migration requirements:
-
-1. Every migration step MUST be idempotent and applied inside one IMMEDIATE transaction that stamps `PRAGMA user_version` before committing.
-2. Existing file contents MUST keep their recorded `chunk_size`; the in-place path does not re-chunk data. A defaulted `inline_threshold` is `min(16384, chunk_size)`.
-3. Open paths (mount, fs, exec, SDK open) MUST NOT run version upgrades implicitly; they reject old schemas and direct the user to `vfs migrate`.
-4. The v0.5 → v0.6 migration creates `fs_session_metadata` and preserves all existing filesystem, overlay, key-value, and tool-call rows.
-5. The v0.6 → v0.7 migration hashes every existing `fs_data.data` blob,
-   deduplicates it into `fs_chunk`, replaces `fs_data.data` with the raw
-   32-byte digest mapping, and initializes the thin journal schema in the same
-   transaction.
-6. The v0.7 → v0.8 migration discards the non-replayable semantic journal,
-   initializes durable history markers, and captures the migrated live state
-   as one immutable root at epoch 1 through sequence 0.
-
-The copy-based mode rebuilds the database with the current chunk layout:
-
-```bash
-vfs migrate <source-old.db> --copy <target.db> --verify
-```
-
-Copy-migration requirements:
-
-1. The source database MUST NOT be modified in place.
-2. The target database MUST be newly created unless an explicit overwrite option is used.
-3. The migration MUST preserve inode numbers, dentries, symlinks, KV rows, tool-call rows, overlay whiteouts, overlay origin mappings, overlay configuration, and session metadata.
-4. Small dense regular files MAY be converted to inline storage.
-5. Chunked files MUST be re-chunked using the target `chunk_size`.
-6. Each non-zero target chunk MUST be hashed into `fs_chunk`; identical
-   content MUST deduplicate and `refcount` MUST equal its live mapping count.
-7. Sparse holes MUST preserve read-back semantics.
-8. Verification MUST run integrity checks and compare source/target metadata and file contents.
-9. After checkpointing the target, copying only the main `.db` file MUST be sufficient to reopen and verify the target state.
+`filesystem_id` is a canonical UUID v4 generated exactly once in the new-schema
+transaction. Files created in that delta have identity `vfs:<filesystem_id>:<ino>`.
+Independent deltas therefore do not alias when their inode numbers coincide.
+Hard links share identity; overlay copy-up retains the originating identity.
+Snapshots, compaction and history reconstruction preserve `filesystem_id`.
+Current databases with a missing or malformed namespace MUST be refused without
+regenerating it. Content digests validate bytes; they do not identify independent files.
 
 ### Consistency Rules
 
@@ -879,48 +855,26 @@ SELECT path FROM fs_whiteout WHERE parent_path = ?
 3. Check if path exists in base layer → return base entry
 4. Return "not found"
 
-### Inode Origin Tracking
+### Persistent Base Origin Tracking
 
-When a file is copied from the base layer to the delta layer during a copy-up operation (e.g., when creating a hard link to a base file), the original base inode number must be preserved. This is necessary because the kernel caches inode numbers, and returning a different inode after copy-up causes ENOENT errors or cache inconsistencies.
-
-This mechanism is similar to Linux overlayfs's `trusted.overlay.origin` extended attribute, which stores a file handle to the lower inode.
-
-#### Table: `fs_origin`
-
-Maps delta layer inodes to their original base layer inodes.
+Copy-up MUST preserve an object's identity independently of an adapter's
+process-local inode cache. `fs_origin` maps a persistent base identity to its
+private delta inode. Visiting a hard-link alias after restart MUST resolve
+to the same private inode even when the base adapter allocates new cache numbers.
+Overlay inode numbers remain mount-local and are not on-disk object identities.
 
 ```sql
 CREATE TABLE fs_origin (
   delta_ino INTEGER PRIMARY KEY,
-  base_ino INTEGER NOT NULL
+  base_identity TEXT NOT NULL UNIQUE
 )
 ```
 
-**Fields:**
-
-- `delta_ino` - Inode number in the delta layer
-- `base_ino` - Original inode number from the base layer
-
-#### Operations
-
-##### Store Origin Mapping
-
-When copying a file from base to delta during copy-up:
-
-```sql
-INSERT OR REPLACE INTO fs_origin (delta_ino, base_ino)
-VALUES (?, ?)
-```
-
-##### Get Origin Inode
-
-When stat'ing a file that exists in delta, check if it has an origin:
-
-```sql
-SELECT base_ino FROM fs_origin WHERE delta_ino = ?
-```
-
-If a mapping exists, return `base_ino` instead of `delta_ino` in stat results.
+A base adapter supplies an opaque stable identity within its configured base.
+Windows HostFS uses the volume serial number and the complete 128-bit native
+file ID. Unix HostFS uses device/inode identity; a Vfs base uses its durable
+inode ID. Identity is preserved in origin journal post-images and root snapshots.
+An overlay used as another base preserves its origin identity across copy-up.
 
 ### Partial-Origin Overlay Mode
 
@@ -935,8 +889,10 @@ original size and metadata, records the base path/fingerprint in
 chunks from the delta layer with unchanged chunks from the base layer.
 
 The base fallback is part of the file's integrity contract. Implementations MUST
-fail reads of partial-origin files if the recorded base size or modification
-metadata no longer matches the current base file. Snapshot/restore of the main
+validate persistent identity before falling back to base bytes. By default,
+reads also fail if the recorded base size or time fingerprint changes. An
+application MAY select an explicit `BaseValidator` content policy (for example,
+hash validation); that policy does not replace persistent identity checks. Snapshot/restore of the main
 delta database is supported only when the same unchanged base path is available.
 A database containing partial-origin rows is not portable on its own:
 `vfs backup` rejects it unless `--materialize` folds the base bytes in,
@@ -979,9 +935,9 @@ pass with the policy enabled.
 3. The `parent_path` MUST be correctly derived from `path`
 4. Whiteouts only affect overlay lookups, not the underlying base filesystem
 5. When copying a file from base to delta, the origin mapping MUST be stored
-6. When stat'ing a delta file with an origin mapping, the base inode MUST be returned
-7. Existing overlay databases with legacy `fs_whiteout(path, created_at)` rows MUST synthesize `parent_path` before using the v0.5 whiteout schema
-8. Partial-origin files MUST remove `fs_partial_origin`, `fs_chunk_override`, and `fs_origin` rows when the last delta link is unlinked
+6. Mount-local overlay inode numbers MUST remain stable across copy-up
+7. Legacy overlay formats MUST be refused before current-format schema operations
+8. Partial-origin sidecars MUST survive while an unlinked private inode has open handles and be collected when that inode is reaped
 
 ## Session Handoff Metadata
 
@@ -1121,10 +1077,8 @@ inside one transaction; it does not hydrate file contents through runtime
 filesystem read APIs.
 
 A new database starts with an `init` snapshot at epoch 1 through sequence 0.
-Migration to v0.8 discards the non-replayable v0.7 journal and its pins,
-creates a `migrate` snapshot at epoch 1 through sequence 0, and sets
-`history_epoch=1`, `history_valid=1`, and `history_floor_seq=0`. In-place and
-copy migration establish the same history boundary.
+The fork does not migrate pre-0.10 history. New databases establish
+`history_epoch=1`, `history_valid=1`, and `history_floor_seq=0`.
 
 ## History Range, Epochs, and Reconstruction
 
@@ -1428,6 +1382,20 @@ idempotent. These refusals are the documented relaxation points if a later
 phase teaches transfer commands to carry lazy state.
 
 ## Revision History
+
+### Version 0.10 (fork)
+
+- Persist immutable UUID namespaces in `fs_config.filesystem_id`.
+- Qualify each delta-created file's identity with its owning namespace.
+- Preserve hard-link and copy-up identity across stacked views and reconstruction.
+- Refuse older ambiguous origins and current missing/malformed namespaces.
+
+### Version 0.9 (fork)
+
+- Replace `fs_origin.base_ino` and snapshot origins with `base_identity` text.
+- Preserve stable origin identities in the row-delta journal.
+- Establish 0.9 as the minimum accepted format; refuse older process-local identities.
+- Add Windows ordinal name semantics and lazy native base identity.
 
 ### Version 0.8
 

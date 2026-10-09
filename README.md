@@ -1,5 +1,15 @@
 # Vfs
 
+This fork adds a Windows filesystem foundation to Factory VFS v1.1.1.
+Windows support currently covers the Rust core and opt-in WinFsp mount library;
+the Unix CLI has not been ported. The fork uses schema 0.10 and refuses older
+formats. See [Windows support and ownership](docs/WINDOWS.md) for build
+requirements, capability limits and the application boundary.
+
+The upstream usage examples below describe the Unix workflows. Historical
+artifact version numbers in those examples are not accepted by this fork.
+
+
 **The filesystem for agents.** A SQLite-backed virtual filesystem with
 copy-on-write sandboxing, mountable over FUSE or NFS — whose live sessions
 seal into a single verifiable file and resume on another machine with the

@@ -75,13 +75,7 @@
         branch_overlay.init("overlay://parent-session").await?;
 
         let (_, branch_file) = branch_overlay
-            .create_file(
-                ROOT_INO,
-                "branch-only.txt",
-                DEFAULT_FILE_MODE,
-                0,
-                0,
-            )
+            .create_file(ROOT_INO, "branch-only.txt", DEFAULT_FILE_MODE, 0, 0)
             .await?;
         branch_file.pwrite(0, b"branch only").await?;
         branch_file.fsync().await?;
@@ -266,14 +260,7 @@
             .symlink(ROOT_INO, "parent-link", "parent-only.txt", 31, 32)
             .await?;
         parent_overlay
-            .mknod(
-                ROOT_INO,
-                "parent-pipe",
-                crate::S_IFIFO | 0o600,
-                0,
-                33,
-                34,
-            )
+            .mknod(ROOT_INO, "parent-pipe", crate::S_IFIFO | 0o600, 0, 33, 34)
             .await?;
         let (_, linked_file) = parent_overlay
             .create_file(ROOT_INO, "linked-a", DEFAULT_FILE_MODE, 41, 42)
@@ -404,13 +391,7 @@
             .await?;
 
         let (_, parent_file) = parent_overlay
-            .create_file(
-                ROOT_INO,
-                "parent-only.txt",
-                DEFAULT_FILE_MODE,
-                0,
-                0,
-            )
+            .create_file(ROOT_INO, "parent-only.txt", DEFAULT_FILE_MODE, 0, 0)
             .await?;
         parent_file.pwrite(0, b"parent database bytes").await?;
         parent_file.fsync().await?;
@@ -1462,9 +1443,8 @@
             std::mem::forget(file);
         }
 
-        let reopened_agent = crate::Vfs::open(
-            crate::VfsOptions::with_path(crash_db_path).with_base(base_dir.path()),
-        )
+        let reopened_agent =
+            crate::Vfs::open(crate::VfsOptions::with_path(crash_db_path).with_base(base_dir.path()))
         .await?;
         let reopened_base = Arc::new(HostFS::new(base_dir.path())?);
         let reopened = OverlayFS::new_with_partial_origin(reopened_base, reopened_agent.fs, true);
@@ -2199,7 +2179,10 @@
     async fn test_overlay_readdir_plus_consistent_with_lookup_for_base_dir() -> Result<()> {
         let base_dir = tempdir()?;
         std::fs::create_dir_all(base_dir.path().join("crates/vfs-core"))?;
-        std::fs::write(base_dir.path().join("crates/vfs-core/lib.rs"), b"fn main() {}")?;
+        std::fs::write(
+            base_dir.path().join("crates/vfs-core/lib.rs"),
+            b"fn main() {}",
+        )?;
 
         let base = Arc::new(HostFS::new(base_dir.path())?);
 
@@ -3387,8 +3370,8 @@
     async fn insert_manual_sidecars(delta: &Vfs, ino: i64) -> Result<()> {
         let conn = delta.get_connection().await?;
         conn.execute(
-            "INSERT OR REPLACE INTO fs_origin (delta_ino, base_ino) VALUES (?, ?)",
-            (ino, 9_001_i64),
+            "INSERT OR REPLACE INTO fs_origin (delta_ino, base_identity) VALUES (?, ?)",
+            (ino, format!("manual:{ino}")),
         )
         .await?;
         conn.execute(
@@ -3450,11 +3433,8 @@
             patterned_bytes(chunk_size * 2 + 9, 0x41),
         )?;
         std::fs::write(base_dir.path().join("hidden.txt"), b"hidden")?;
-        let overlay = OverlayFS::new_with_partial_origin(
-            Arc::new(HostFS::new(base_dir.path())?),
-            delta,
-            true,
-        );
+        let overlay =
+            OverlayFS::new_with_partial_origin(Arc::new(HostFS::new(base_dir.path())?), delta, true);
         overlay.init(base_dir.path().to_str().unwrap()).await?;
 
         let baseline = scalar_i64(&overlay, "SELECT COALESCE(MAX(seq), 0) FROM fs_op_journal").await?;
@@ -3474,12 +3454,7 @@
         }
         let copy_up_txns = copy_up
             .iter()
-            .filter(|(_, label)| {
-                matches!(
-                    label.as_str(),
-                    "copyup" | "origin_map" | "partial_origin"
-                )
-            })
+            .filter(|(_, label)| matches!(label.as_str(), "copyup" | "origin_map" | "partial_origin"))
             .map(|(txn_id, _)| *txn_id)
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(copy_up_txns.len(), 1, "partial copy-up must be one SQLite txn");
@@ -3543,11 +3518,8 @@
             ..crate::CoreConfig::default()
         };
         let delta = Vfs::from_pool_with_config(pool, config).await?;
-        let overlay = OverlayFS::new_with_partial_origin(
-            Arc::new(HostFS::new(base_dir.path())?),
-            delta,
-            true,
-        );
+        let overlay =
+            OverlayFS::new_with_partial_origin(Arc::new(HostFS::new(base_dir.path())?), delta, true);
         overlay.init(base_dir.path().to_str().unwrap()).await?;
 
         let stats = overlay.lookup(ROOT_INO, "base.bin").await?.unwrap();

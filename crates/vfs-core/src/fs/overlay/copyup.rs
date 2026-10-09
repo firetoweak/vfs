@@ -31,28 +31,18 @@ impl OverlayFS {
     }
 
     fn validate_partial_origin(&self, origin: &PartialOrigin, stats: &Stats) -> Result<()> {
-        if stats.size != origin.base_fingerprint_size {
-            return Err(Error::Internal(format!(
-                "partial-origin base changed for {} (stored size={}, current size={})",
-                origin.base_path, origin.base_fingerprint_size, stats.size
-            )));
+        if self.base.file_identity(stats.ino)? != origin.base_identity {
+            return Err(FsError::Corrupt("partial-origin base identity changed".into()).into());
         }
-        if stats.mtime != origin.base_mtime
-            || stats.mtime_nsec != origin.base_mtime_nsec
-            || stats.ctime != origin.base_ctime
-            || stats.ctime_nsec != origin.base_ctime_nsec
-        {
+        if let Some(validator) = &self.base_validator {
+            return validator.validate(self.base.as_ref(), stats);
+        }
+        if crate::fs::base_fingerprint::BaseFingerprint::from_stats(stats) != origin.fingerprint() {
             return Err(Error::Internal(format!(
-                "partial-origin base changed for {} (stored mtime={}.{}, current mtime={}.{}, stored ctime={}.{}, current ctime={}.{})",
+                "partial-origin base changed for {} (stored {:?}, current {:?})",
                 origin.base_path,
-                origin.base_mtime,
-                origin.base_mtime_nsec,
-                stats.mtime,
-                stats.mtime_nsec,
-                origin.base_ctime,
-                origin.base_ctime_nsec,
-                stats.ctime,
-                stats.ctime_nsec
+                origin.fingerprint(),
+                crate::fs::base_fingerprint::BaseFingerprint::from_stats(stats)
             )));
         }
         Ok(())
@@ -115,6 +105,9 @@ impl OverlayFS {
             ));
         }
         txn.commit().await?;
+        self.origin_map
+            .write()
+            .retain(|_, mapped| *mapped != delta_ino);
         Ok(())
     }
 
@@ -400,7 +393,8 @@ impl OverlayFS {
             ),
         )
         .await?;
-        Self::add_origin_mapping_with_conn(txn.conn(), delta_ino, info.underlying_ino).await?;
+        let base_identity = self.base.file_identity(info.underlying_ino)?;
+        Self::add_origin_mapping_with_conn(txn.conn(), delta_ino, &base_identity).await?;
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as i64;
         Self::add_partial_origin_mapping_with_conn(
             txn.conn(),
@@ -440,7 +434,7 @@ impl OverlayFS {
         txn.record(super::super::vfs::JournalDelta::origin_upsert(
             "origin_map",
             delta_ino,
-            info.underlying_ino,
+            &base_identity,
         ));
         txn.record(super::super::vfs::JournalDelta::partial_origin_upsert(
             "partial_origin",
@@ -461,9 +455,7 @@ impl OverlayFS {
 
         self.delta.publish_created_file(parent_ino, name, &stats);
         self.delta.invalidate_attr(delta_ino);
-        self.origin_map
-            .write()
-            .insert(delta_ino, info.underlying_ino);
+        self.origin_map.write().insert(base_identity, delta_ino);
         self.refresh_overlay_mapping(overlay_ino, Layer::Delta, delta_ino, &info.path);
 
         Ok(delta_ino)
@@ -500,7 +492,7 @@ impl OverlayFS {
             // OverlayPartialFile wrapper so writes land as `fs_chunk_override`
             // rows in the delta DB and never touch the real base file
             // (no-real-write invariant from Tier One).
-            if !is_write_open(flags) {
+            if !is_write_open(flags) && self.base_validator.is_none() {
                 crate::telemetry::record_base_fast_open_passthrough_attempted();
                 if self
                     .delta_has_no_content_overrides(delta_ino, base_stats.size)
@@ -513,9 +505,12 @@ impl OverlayFS {
             }
 
             let file: BoxedFile = Arc::new(OverlayPartialFile {
+                _delta_handle: FileSystem::open(&self.delta, delta_ino, flags & !libc::O_TRUNC)
+                    .await?,
                 delta: self.delta.clone(),
                 base: self.base.clone(),
                 base_file,
+                base_validator: self.base_validator.clone(),
                 origin,
                 overlay_ino,
                 delta_ino,
@@ -526,7 +521,10 @@ impl OverlayFS {
             }
             Ok(file)
         } else {
-            FileSystem::open(&self.delta, delta_ino, flags).await
+            Ok(mount_visible_file(
+                FileSystem::open(&self.delta, delta_ino, flags).await?,
+                overlay_ino,
+            ))
         }
     }
 

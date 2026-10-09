@@ -9,3 +9,8 @@ mod linux;
 pub use darwin::HostFS;
 #[cfg(target_os = "linux")]
 pub use linux::HostFS;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::HostFS;

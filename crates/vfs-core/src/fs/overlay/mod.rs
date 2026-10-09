@@ -9,6 +9,7 @@ mod copyup;
 mod fs;
 mod maps;
 mod materialize;
+mod names;
 mod partial;
 mod whiteouts;
 
@@ -106,7 +107,7 @@ pub(crate) fn parent_path_for_whiteout(path: &str) -> String {
 }
 
 fn is_write_open(flags: i32) -> bool {
-    (flags & libc::O_ACCMODE) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0
+    (flags & (libc::O_WRONLY | libc::O_RDWR)) != libc::O_RDONLY || (flags & libc::O_TRUNC) != 0
 }
 
 fn mount_visible_file(inner: BoxedFile, overlay_ino: i64) -> BoxedFile {
@@ -155,6 +156,12 @@ impl File for MountVisibleFile {
     }
 }
 
+/// An application-selected validation contract for a mutable read-only base.
+/// Without one, partial origins require the stored size and time fingerprint.
+pub trait BaseValidator: Send + Sync {
+    fn validate(&self, base: &dyn FileSystem, stats: &Stats) -> Result<()>;
+}
+
 /// A copy-on-write overlay filesystem using inode-based operations.
 ///
 /// Combines a read-only base layer with a writable delta layer (`Vfs`).
@@ -180,16 +187,22 @@ pub struct OverlayFS {
     maps: Mutex<OverlayMaps>,
     /// Set of whiteout paths (deleted from base)
     whiteouts: RwLock<HashSet<String>>,
-    /// Origin mapping: delta_ino -> base_ino (for copy-up consistency)
-    origin_map: RwLock<HashMap<i64, i64>>,
+    /// Persisted base identity -> delta inode, rebuilt after history restoration.
+    origin_map: RwLock<HashMap<String, i64>>,
     /// Explicit policy for chunk-granularity base fallback.
     partial_origin_policy: PartialOriginPolicy,
+    base_validator: Option<Arc<dyn BaseValidator>>,
     /// Test-only fault injection for whiteout transaction rollback coverage.
     #[cfg(test)]
     whiteout_fault: Mutex<Option<String>>,
 }
 
 impl OverlayFS {
+    /// Select content validation for a mutable base. Persistent identity remains mandatory.
+    pub fn with_base_validator(mut self, validator: Arc<dyn BaseValidator>) -> Self {
+        self.base_validator = Some(validator);
+        self
+    }
     /// Create a new overlay filesystem
     pub fn new(base: Arc<dyn FileSystem>, delta: Vfs) -> Self {
         let partial_origin_policy = delta.partial_origin_policy();
@@ -204,7 +217,7 @@ impl OverlayFS {
         Self::new_with_partial_origin_policy_inner(base, delta, partial_origin_policy)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn new_with_partial_origin(
         base: Arc<dyn FileSystem>,
         delta: Vfs,
@@ -230,6 +243,7 @@ impl OverlayFS {
             whiteouts: RwLock::new(HashSet::new()),
             origin_map: RwLock::new(HashMap::new()),
             partial_origin_policy,
+            base_validator: None,
             #[cfg(test)]
             whiteout_fault: Mutex::new(None),
         }
@@ -254,12 +268,7 @@ impl OverlayFS {
         let mut rows = conn.query("SELECT path FROM fs_whiteout", ()).await?;
         let mut paths = Vec::new();
         while let Some(row) = rows.next().await? {
-            if let Some(path) = row.get_value(0).ok().and_then(|v| match v {
-                Value::Text(s) => Some(s.clone()),
-                _ => None,
-            }) {
-                paths.push(path);
-            }
+            paths.push(row.get::<String>(0)?);
         }
         let mut whiteouts = self.whiteouts.write();
         for path in paths {
@@ -286,15 +295,13 @@ impl OverlayFS {
     /// Load origin mappings from database.
     async fn load_origins(&self, conn: &Connection) -> Result<()> {
         let mut rows = conn
-            .query("SELECT delta_ino, base_ino FROM fs_origin", ())
+            .query("SELECT delta_ino, base_identity FROM fs_origin", ())
             .await?;
         let mut mappings = Vec::new();
         while let Some(row) = rows.next().await? {
-            let delta_ino = row.get_value(0).ok().and_then(|v| v.as_integer().copied());
-            let base_ino = row.get_value(1).ok().and_then(|v| v.as_integer().copied());
-            if let (Some(d), Some(b)) = (delta_ino, base_ino) {
-                mappings.push((d, b));
-            }
+            let delta_ino: i64 = row.get(0)?;
+            let base_identity: String = row.get(1)?;
+            mappings.push((base_identity, delta_ino));
         }
         let mut origins = self.origin_map.write();
         for (d, b) in mappings {
@@ -309,7 +316,7 @@ impl OverlayFS {
     }
 
     /// Get a reference to the delta layer
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn delta(&self) -> &Vfs {
         &self.delta
     }

@@ -1,5 +1,44 @@
 # Changelog
 
+## [Unreleased] - Windows filesystem foundation
+
+- Map Windows read-only attributes to existing core mode bits, preserving host
+  permissions; refuse other attribute changes and timestamp updates.
+
+- Add lazy read-only Windows HostFS with native handle identity and ordinal name matching.
+- Store persistent base identities in origin rows, row-delta history and root snapshots.
+  Fork schema 0.10 rejects older formats before schema mutation; old process-local
+  or unnamespaced inode identities cannot be assigned physical/delta owners reliably.
+- Persist a UUID creation namespace in each fresh delta. Independently created files
+  in stacked deltas remain distinct even when their inode numbers and bytes match;
+  hard links and copy-up retain identity through reopen, snapshots and reconstruction.
+- Preserve partial-origin inode lifetime across unlink and expose a general base
+  content validator. Whole-chunk overwrites retain the no-base-read fast path.
+- Add opt-in x64 WinFsp SDK mounting through `vfs-mount`; callbacks dispatch directly
+  to `FileSystem`, with explicit flush and unmount commit barriers.
+- Keep Command effects, publication and undo policies outside this filesystem fork.
+- Keep overlay file-handle stat identities consistent with namespace lookup,
+  including created and whole-file copied-up files. Add Windows process-crash
+  checkpoints with separate command and mount-owner processes.
+- Return native disk-full errors for WinFsp writes and Flush without poisoning
+  the mount; retain the original cause of unexpected I/O failures for unmount.
+- Support WinFsp directory creation and empty-directory deletion through the
+  existing core operations, including nested creation beneath read-only base
+  directories. Reject nonempty-directory deletion with the native error.
+- Support WinFsp file replacement rename through the core rename operation,
+  preserving the native refusal for destinations with open handles. Clean up
+  reclaimed replacement origins in the live overlay mapping so enumeration
+  does not report a missing inode after replacing a partial COW file.
+- Return actual path spelling from WinFsp Create/Open and allow case-only file
+  rename without replacement, preventing the driver from acknowledging an
+  unintended uppercase-name no-op. Preserve nested Unicode names in handle paths.
+- Reuse each name-resolution result during stacked overlay lookup, avoiding
+  repeated base traversals for missing names while preserving distinct hard-link
+  entry spellings. Add 32-layer lookup and hard-link spelling regression tests.
+- Make the structural canon scanner use UTF-8 and normalized path separators
+  when run with Windows Python, retaining the same source-boundary checks.
+
+
 ## [1.1.1] - 2026-08-10 - The turso 0.7.2 engine upgrade
 
 ### Changed

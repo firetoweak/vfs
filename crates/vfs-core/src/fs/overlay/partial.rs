@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub(super) struct PartialOrigin {
+    pub(super) base_identity: String,
     pub(super) base_ino: i64,
     pub(super) base_path: String,
     pub(super) base_fingerprint_size: i64,
@@ -16,10 +17,25 @@ pub(super) struct PartialOrigin {
     pub(super) created_at: i64,
 }
 
+impl PartialOrigin {
+    pub(super) fn fingerprint(&self) -> crate::fs::base_fingerprint::BaseFingerprint {
+        crate::fs::base_fingerprint::BaseFingerprint {
+            size: self.base_fingerprint_size,
+            mtime: self.base_mtime,
+            mtime_nsec: self.base_mtime_nsec as i64,
+            ctime: self.base_ctime,
+            ctime_nsec: self.base_ctime_nsec as i64,
+        }
+    }
+}
+
 pub(super) struct OverlayPartialFile {
     pub(super) delta: Vfs,
+    // Retain the inode for the lifetime of this file, like ordinary delta opens.
+    pub(super) _delta_handle: super::super::BoxedFile,
     pub(super) base: Arc<dyn FileSystem>,
     pub(super) base_file: super::super::BoxedFile,
+    pub(super) base_validator: Option<Arc<dyn BaseValidator>>,
     pub(super) origin: PartialOrigin,
     pub(super) overlay_ino: i64,
     pub(super) delta_ino: i64,
@@ -77,74 +93,29 @@ impl OverlayFS {
         let mut rows = conn
             .query(
                 "SELECT base_ino, base_path, base_size, base_fingerprint_size,
-                        base_mtime, base_mtime_nsec, base_ctime, base_ctime_nsec, created_at
+                        base_mtime, base_mtime_nsec, base_ctime, base_ctime_nsec, created_at,
+                        (SELECT base_identity FROM fs_origin WHERE fs_origin.delta_ino = fs_partial_origin.delta_ino)
                  FROM fs_partial_origin WHERE delta_ino = ?",
                 (delta_ino,),
             )
             .await?;
         if let Some(row) = rows.next().await? {
-            let base_ino = row
-                .get_value(0)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| Error::Internal("invalid partial origin base_ino".to_string()))?;
-            let base_path = match row.get_value(1)? {
-                Value::Text(path) => path,
-                _ => {
-                    return Err(Error::Internal(
-                        "invalid partial origin base_path".to_string(),
-                    ))
-                }
-            };
-            let base_size = row
-                .get_value(2)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .ok_or_else(|| Error::Internal("invalid partial origin base_size".to_string()))?;
-            let base_fingerprint_size = row
-                .get_value(3)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(base_size);
-            let base_mtime = row
-                .get_value(4)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0);
-            let base_mtime_nsec = row
-                .get_value(5)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
-            let base_ctime = row
-                .get_value(6)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0);
-            let base_ctime_nsec = row
-                .get_value(7)
-                .ok()
-                .and_then(|v| v.as_integer().copied())
-                .unwrap_or(0) as u32;
+            let base_fingerprint_size: i64 = row.get(3)?;
+            if base_fingerprint_size < 0 {
+                return Err(
+                    FsError::Corrupt("partial origin has no base fingerprint".into()).into(),
+                );
+            }
             Ok(Some(PartialOrigin {
-                base_ino,
-                base_path,
-                base_fingerprint_size: if base_fingerprint_size < 0 {
-                    base_size
-                } else {
-                    base_fingerprint_size
-                },
-                base_mtime,
-                base_mtime_nsec,
-                base_ctime,
-                base_ctime_nsec,
-                created_at: row
-                    .get_value(8)
-                    .ok()
-                    .and_then(|v| v.as_integer().copied())
-                    .ok_or_else(|| {
-                        Error::Internal("invalid partial origin created_at".to_string())
-                    })?,
+                base_identity: row.get(9)?,
+                base_ino: row.get(0)?,
+                base_path: row.get(1)?,
+                base_fingerprint_size,
+                base_mtime: row.get(4)?,
+                base_mtime_nsec: row.get(5)?,
+                base_ctime: row.get(6)?,
+                base_ctime_nsec: row.get(7)?,
+                created_at: row.get(8)?,
             }))
         } else {
             Ok(None)
@@ -402,11 +373,14 @@ impl OverlayPartialFile {
             .resolve_origin_base_stats()
             .await?
             .ok_or(FsError::NotFound)?;
-        if stats.size != self.origin.base_fingerprint_size
-            || stats.mtime != self.origin.base_mtime
-            || stats.mtime_nsec != self.origin.base_mtime_nsec
-            || stats.ctime != self.origin.base_ctime
-            || stats.ctime_nsec != self.origin.base_ctime_nsec
+        if self.base.file_identity(stats.ino)? != self.origin.base_identity {
+            return Err(FsError::Corrupt("partial-origin base identity changed".into()).into());
+        }
+        if let Some(validator) = &self.base_validator {
+            return validator.validate(self.base.as_ref(), &stats);
+        }
+        if crate::fs::base_fingerprint::BaseFingerprint::from_stats(&stats)
+            != self.origin.fingerprint()
         {
             return Err(Error::Internal(format!(
                 "partial-origin base changed for {}",

@@ -222,6 +222,15 @@ impl HostFS {
 
 #[async_trait]
 impl FileSystem for HostFS {
+    fn file_identity(&self, ino: i64) -> Result<String> {
+        let inodes = self.inodes.read().unwrap();
+        let inode = inodes.get(&ino).ok_or(FsError::NotFound)?;
+        Ok(format!(
+            "unix:{:016x}:{:016x}",
+            inode.src_dev, inode.src_ino
+        ))
+    }
+
     fn external_watch_root(&self) -> Option<PathBuf> {
         Some(self.root.clone())
     }

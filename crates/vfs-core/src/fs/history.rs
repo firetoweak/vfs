@@ -184,7 +184,7 @@ struct WhiteoutKey {
 #[derive(Debug, Deserialize)]
 struct OriginDelta {
     delta_ino: i64,
-    base_ino: i64,
+    base_identity: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,7 +253,7 @@ struct ReplayState {
     data: BTreeMap<(i64, i64), Vec<u8>>,
     symlinks: BTreeMap<i64, String>,
     whiteouts: BTreeMap<String, WhiteoutDelta>,
-    origins: BTreeMap<i64, i64>,
+    origins: BTreeMap<i64, String>,
     partial_origins: BTreeMap<i64, PartialOriginDelta>,
     chunk_overrides: BTreeSet<(i64, i64)>,
     overlay_config: BTreeMap<String, String>,
@@ -863,7 +863,7 @@ async fn load_snapshot_state(conn: &Connection, snapshot_id: i64) -> Result<Repl
 
     let mut rows = conn
         .query(
-            "SELECT delta_ino, base_ino
+            "SELECT delta_ino, base_identity
              FROM fs_snapshot_origin WHERE snapshot_id = ?",
             (snapshot_id,),
         )
@@ -1012,7 +1012,7 @@ fn apply_delta_to_state(state: &mut ReplayState, delta: &JournalRow) -> Result<(
         }
         ("fs_origin", "upsert") => {
             let row: OriginDelta = serde_json::from_str(&delta.row)?;
-            state.origins.insert(row.delta_ino, row.base_ino);
+            state.origins.insert(row.delta_ino, row.base_identity);
         }
         ("fs_origin", "delete") => {
             let row: DeltaInoKey = serde_json::from_str(&delta.row)?;
@@ -1176,10 +1176,12 @@ async fn install_state_as_live(
             .await?;
     }
     let mut origin_stmt = conn
-        .prepare_cached("INSERT INTO fs_origin (delta_ino, base_ino) VALUES (?, ?)")
+        .prepare_cached("INSERT INTO fs_origin (delta_ino, base_identity) VALUES (?, ?)")
         .await?;
-    for (delta_ino, base_ino) in &state.origins {
-        origin_stmt.execute((*delta_ino, *base_ino)).await?;
+    for (delta_ino, base_identity) in &state.origins {
+        origin_stmt
+            .execute((*delta_ino, base_identity.as_str()))
+            .await?;
     }
     let mut partial_stmt = conn
         .prepare_cached(
@@ -1534,12 +1536,12 @@ async fn capture_state_root(
     let mut origin_stmt = conn
         .prepare_cached(
             "INSERT INTO fs_snapshot_origin
-             (snapshot_id, delta_ino, base_ino) VALUES (?, ?, ?)",
+             (snapshot_id, delta_ino, base_identity) VALUES (?, ?, ?)",
         )
         .await?;
-    for (delta_ino, base_ino) in &state.origins {
+    for (delta_ino, base_identity) in &state.origins {
         origin_stmt
-            .execute((snapshot_id, *delta_ino, *base_ino))
+            .execute((snapshot_id, *delta_ino, base_identity.as_str()))
             .await?;
     }
     let mut partial_stmt = conn
@@ -1984,7 +1986,7 @@ mod tests {
         ),
         (
             "fs_origin",
-            "SELECT delta_ino, base_ino FROM fs_origin ORDER BY delta_ino",
+            "SELECT delta_ino, base_identity FROM fs_origin ORDER BY delta_ino",
             2,
         ),
         (
@@ -2233,11 +2235,15 @@ mod tests {
         ));
         txn.conn()
             .execute(
-                "INSERT INTO fs_origin (delta_ino, base_ino) VALUES (?, 42)",
+                "INSERT INTO fs_origin (delta_ino, base_identity) VALUES (?, 'test:42')",
                 (stats.ino,),
             )
             .await?;
-        txn.record(JournalDelta::origin_upsert("test_overlay", stats.ino, 42));
+        txn.record(JournalDelta::origin_upsert(
+            "test_overlay",
+            stats.ino,
+            "test:42",
+        ));
         let partial = PartialOriginRow {
             delta_ino: stats.ino,
             base_ino: 42,

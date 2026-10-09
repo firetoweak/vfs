@@ -3,103 +3,89 @@ use crate::fs::{
     BoxedFile, DirEntry, FileSystem, FilesystemStats, FsError, KernelCachePolicy, Stats, TimeChange,
 };
 use async_trait::async_trait;
-use std::collections::{HashMap, HashSet};
+
 use tracing::trace;
 
-#[async_trait]
-impl FileSystem for OverlayFS {
-    async fn lookup(&self, parent_ino: i64, name: &str) -> Result<Option<Stats>> {
+impl OverlayFS {
+    async fn lookup_resolved(
+        &self,
+        parent_ino: i64,
+        name: &str,
+        base_stats: Option<Stats>,
+    ) -> Result<Option<Stats>> {
         crate::telemetry::record_lookup();
         trace!(
             "OverlayFS::lookup: parent_ino={}, name={}",
             parent_ino,
             name
         );
-
         let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
         let path = self.build_path(parent_ino, name)?;
-
-        // Check for whiteout
         if self.is_whiteout(&path) {
             crate::telemetry::record_lookup_whiteout();
             crate::telemetry::record_negative_lookup();
             return Ok(None);
         }
-
-        // Try delta first
         let delta_parent_ino = self.resolve_delta_parent(&parent_info).await?;
-
-        // Look up in delta (only if we resolved the correct parent)
-        if let Some(delta_stats) = match delta_parent_ino {
+        if let Some(mut stats) = match delta_parent_ino {
             Some(ino) => {
                 crate::telemetry::record_lookup_delta();
                 self.delta.lookup(ino, name).await?
             }
             None => None,
         } {
-            let delta_ino = delta_stats.ino;
-            let ino = self.get_or_create_overlay_ino(Layer::Delta, delta_ino, &path);
-            let mut stats = delta_stats;
-
-            // Origin mapping: reuse an existing Base overlay inode for stable
-            // numbering within a session.  After remount the base_ino stored in
-            // the mapping may be stale (the new HostFS has a fresh inode cache),
-            // so only use it when the reverse_map already contains a live entry.
-            // Otherwise keep the Delta overlay inode — the downstream code
-            // already walks base from root when the parent is tagged Delta.
-            if let Some(base_ino) = self.get_origin_ino(stats.ino) {
-                if let Some(existing_ino) = self.live_origin_overlay_ino(base_ino, &path) {
-                    self.refresh_overlay_mapping(existing_ino, Layer::Delta, delta_ino, &path);
-                    stats.ino = existing_ino;
-                } else {
-                    stats.ino = ino;
-                }
-            } else {
-                stats.ino = ino;
-            }
-
+            stats.ino = self.get_or_create_overlay_ino(Layer::Delta, stats.ino, &path);
             return Ok(Some(stats));
         }
-
-        // Try base
-        let base_parent_ino = if parent_info.layer == Layer::Base {
-            parent_info.underlying_ino
-        } else {
-            // Need to find corresponding base parent by path
-            // For root, use base root (1)
-            if parent_info.path == "/" {
-                1
-            } else {
-                // Walk the base to find the parent
-                let mut base_ino: i64 = 1;
-                let components: Vec<_> = parent_info
-                    .path
-                    .split('/')
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                crate::telemetry::record_path_resolution(components.len() as u64);
-                for comp in components {
-                    if let Some(s) = self.base.lookup(base_ino, comp).await? {
-                        base_ino = s.ino;
-                    } else {
-                        crate::telemetry::record_negative_lookup();
-                        return Ok(None);
-                    }
-                }
-                base_ino
-            }
-        };
-
+        // Name resolution already queried the base. Repeating it at each
+        // stacked layer makes a missing-name lookup grow exponentially.
         crate::telemetry::record_lookup_base();
-        if let Some(base_stats) = self.base.lookup(base_parent_ino, name).await? {
-            let ino = self.get_or_create_overlay_ino(Layer::Base, base_stats.ino, &path);
-            let mut stats = base_stats;
-            stats.ino = ino;
-            return Ok(Some(stats));
+        if let Some(stats) = base_stats {
+            return Ok(Some(self.stats_for_base(stats, &path).await?));
         }
-
         crate::telemetry::record_negative_lookup();
         Ok(None)
+    }
+}
+
+#[async_trait]
+impl FileSystem for OverlayFS {
+    fn names_equal(&self, left: &str, right: &str) -> bool {
+        self.base.names_equal(left, right)
+    }
+    fn file_identity(&self, ino: i64) -> Result<String> {
+        let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
+        match info.layer {
+            Layer::Base => self.base.file_identity(info.underlying_ino),
+            Layer::Delta => {
+                if let Some((identity, _)) = self
+                    .origin_map
+                    .read()
+                    .iter()
+                    .find(|(_, delta)| **delta == info.underlying_ino)
+                {
+                    return Ok(identity.clone());
+                }
+                self.delta.file_identity(info.underlying_ino)
+            }
+        }
+    }
+    async fn lookup_named(&self, parent: i64, name: &str) -> Result<Option<DirEntry>> {
+        let (actual, base_stats) = self.resolve_lookup_name(parent, name).await?;
+        Ok(self
+            .lookup_resolved(parent, &actual, base_stats)
+            .await?
+            .map(|stats| DirEntry {
+                name: actual,
+                stats,
+                cookie: 0,
+            }))
+    }
+
+    async fn lookup(&self, parent_ino: i64, name: &str) -> Result<Option<Stats>> {
+        let (resolved_name, base_stats) = self.resolve_lookup_name(parent_ino, name).await?;
+        self.lookup_resolved(parent_ino, &resolved_name, base_stats)
+            .await
     }
 
     async fn getattr(&self, ino: i64) -> Result<Option<Stats>> {
@@ -155,7 +141,7 @@ impl FileSystem for OverlayFS {
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
         let child_whiteouts = self.get_child_whiteouts(&info.path);
 
-        let mut entries = HashSet::new();
+        let mut entries: Vec<String> = Vec::new();
 
         // Get delta entries
         if info.layer == Layer::Delta {
@@ -166,8 +152,15 @@ impl FileSystem for OverlayFS {
                     } else {
                         format!("{}/{}", info.path, entry)
                     };
-                    if !self.is_whiteout(&entry_path) && !child_whiteouts.contains(&entry) {
-                        entries.insert(entry);
+                    if !self.is_whiteout(&entry_path)
+                        && !child_whiteouts
+                            .iter()
+                            .any(|hidden| self.base.names_equal(hidden, &entry))
+                        && !entries
+                            .iter()
+                            .any(|existing| self.base.names_equal(existing, &entry))
+                    {
+                        entries.push(entry);
                     }
                 }
             }
@@ -199,14 +192,22 @@ impl FileSystem for OverlayFS {
 
         if let Some(base_ino) = base_ino {
             if let Some(base_entries) = self.base.readdir(base_ino).await? {
+                let private_entries = entries.clone();
                 for entry in base_entries {
                     let entry_path = if info.path == "/" {
                         format!("/{}", entry)
                     } else {
                         format!("{}/{}", info.path, entry)
                     };
-                    if !self.is_whiteout(&entry_path) && !child_whiteouts.contains(&entry) {
-                        entries.insert(entry);
+                    if !self.is_whiteout(&entry_path)
+                        && !child_whiteouts
+                            .iter()
+                            .any(|hidden| self.base.names_equal(hidden, &entry))
+                        && !private_entries
+                            .iter()
+                            .any(|existing| self.base.names_equal(existing, &entry))
+                    {
+                        entries.push(entry);
                     }
                 }
             }
@@ -224,7 +225,7 @@ impl FileSystem for OverlayFS {
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
         let child_whiteouts = self.get_child_whiteouts(&info.path);
 
-        let mut entries_map: HashMap<String, DirEntry> = HashMap::new();
+        let mut entries_map: Vec<DirEntry> = Vec::new();
 
         // Get base entries first (so delta can override)
         let base_ino = if info.layer == Layer::Base {
@@ -258,14 +259,13 @@ impl FileSystem for OverlayFS {
                         format!("{}/{}", info.path, entry.name)
                     };
 
-                    if !self.is_whiteout(&entry_path) && !child_whiteouts.contains(&entry.name) {
-                        let overlay_ino = self.get_or_create_overlay_ino(
-                            Layer::Base,
-                            entry.stats.ino,
-                            &entry_path,
-                        );
-                        entry.stats.ino = overlay_ino;
-                        entries_map.insert(entry.name.clone(), entry);
+                    if !self.is_whiteout(&entry_path)
+                        && !child_whiteouts
+                            .iter()
+                            .any(|hidden| self.base.names_equal(hidden, &entry.name))
+                    {
+                        entry.stats = self.stats_for_base(entry.stats, &entry_path).await?;
+                        entries_map.push(entry);
                     }
                 }
             }
@@ -280,43 +280,24 @@ impl FileSystem for OverlayFS {
                     } else {
                         format!("{}/{}", info.path, entry.name)
                     };
-                    if self.is_whiteout(&entry_path) || child_whiteouts.contains(&entry.name) {
+                    if self.is_whiteout(&entry_path)
+                        || child_whiteouts
+                            .iter()
+                            .any(|hidden| self.base.names_equal(hidden, &entry.name))
+                    {
                         continue;
                     }
 
-                    // Check for origin mapping
-                    let delta_ino = entry.stats.ino;
-                    if let Some(base_ino) = self.get_origin_ino(entry.stats.ino) {
-                        let overlay_ino =
-                            self.get_or_create_overlay_ino(Layer::Delta, delta_ino, &entry_path);
-                        if let Some(existing_ino) =
-                            self.live_origin_overlay_ino(base_ino, &entry_path)
-                        {
-                            self.refresh_overlay_mapping(
-                                existing_ino,
-                                Layer::Delta,
-                                delta_ino,
-                                &entry_path,
-                            );
-                            entry.stats.ino = existing_ino;
-                        } else {
-                            entry.stats.ino = overlay_ino;
-                        }
-                    } else {
-                        let overlay_ino = self.get_or_create_overlay_ino(
-                            Layer::Delta,
-                            entry.stats.ino,
-                            &entry_path,
-                        );
-                        entry.stats.ino = overlay_ino;
-                    }
+                    entry.stats.ino =
+                        self.get_or_create_overlay_ino(Layer::Delta, entry.stats.ino, &entry_path);
 
-                    entries_map.insert(entry.name.clone(), entry);
+                    entries_map.retain(|old| !self.base.names_equal(&old.name, &entry.name));
+                    entries_map.push(entry);
                 }
             }
         }
 
-        let mut result: Vec<_> = entries_map.into_values().collect();
+        let mut result: Vec<_> = entries_map.into_iter().collect();
         result.sort_by(|a, b| a.name.cmp(&b.name));
         for (index, entry) in result.iter_mut().enumerate() {
             entry.cookie = (index + 1) as i64;
@@ -421,7 +402,11 @@ impl FileSystem for OverlayFS {
             // Delta (DB-backed) files inherit the Vfs keep-cache policy:
             // the adapter fingerprint guard revalidates per open.
             Layer::Delta => {
-                FileSystem::keep_cache_for_read_open(&self.delta, info.underlying_ino, flags).await
+                Ok(
+                    FileSystem::keep_cache_for_read_open(&self.delta, info.underlying_ino, flags)
+                        .await?
+                        .map(|stats| Stats { ino, ..stats }),
+                )
             }
         }
     }
@@ -489,7 +474,10 @@ impl FileSystem for OverlayFS {
 
         let delta_ino = self.copy_up_and_update_mapping(ino, &info).await?;
 
-        FileSystem::open(&self.delta, delta_ino, flags).await
+        Ok(mount_visible_file(
+            FileSystem::open(&self.delta, delta_ino, flags).await?,
+            ino,
+        ))
     }
 
     async fn mkdir(
@@ -502,6 +490,8 @@ impl FileSystem for OverlayFS {
     ) -> Result<Stats> {
         trace!("OverlayFS::mkdir: parent_ino={}, name={}", parent_ino, name);
 
+        let resolved_name = self.resolve_name(parent_ino, name).await?;
+        let name = resolved_name.as_str();
         let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
         let path = self.build_path(parent_ino, name)?;
 
@@ -543,8 +533,14 @@ impl FileSystem for OverlayFS {
             name
         );
 
+        let resolved_name = self.resolve_name(parent_ino, name).await?;
+        let name = resolved_name.as_str();
         let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
         let path = self.build_path(parent_ino, name)?;
+
+        if self.lookup(parent_ino, name).await?.is_some() {
+            return Err(FsError::AlreadyExists.into());
+        }
 
         // Remove whiteout if exists
         self.remove_whiteout(&path).await?;
@@ -562,7 +558,7 @@ impl FileSystem for OverlayFS {
         let overlay_ino = self.get_or_create_overlay_ino(Layer::Delta, stats.ino, &path);
         stats.ino = overlay_ino;
 
-        Ok((stats, file))
+        Ok((stats, mount_visible_file(file, overlay_ino)))
     }
 
     async fn mknod(
@@ -576,8 +572,14 @@ impl FileSystem for OverlayFS {
     ) -> Result<Stats> {
         trace!("OverlayFS::mknod: parent_ino={}, name={}", parent_ino, name);
 
+        let resolved_name = self.resolve_name(parent_ino, name).await?;
+        let name = resolved_name.as_str();
         let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
         let path = self.build_path(parent_ino, name)?;
+
+        if self.lookup(parent_ino, name).await?.is_some() {
+            return Err(FsError::AlreadyExists.into());
+        }
 
         self.remove_whiteout(&path).await?;
         self.ensure_parent_dirs(&path, uid, gid).await?;
@@ -610,8 +612,14 @@ impl FileSystem for OverlayFS {
             target
         );
 
+        let resolved_name = self.resolve_name(parent_ino, name).await?;
+        let name = resolved_name.as_str();
         let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
         let path = self.build_path(parent_ino, name)?;
+
+        if self.lookup(parent_ino, name).await?.is_some() {
+            return Err(FsError::AlreadyExists.into());
+        }
 
         self.remove_whiteout(&path).await?;
         self.ensure_parent_dirs(&path, uid, gid).await?;
@@ -636,6 +644,8 @@ impl FileSystem for OverlayFS {
             name
         );
 
+        let resolved_name = self.resolve_name(parent_ino, name).await?;
+        let name = resolved_name.as_str();
         let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
         let path = self.build_path(parent_ino, name)?;
 
@@ -676,6 +686,8 @@ impl FileSystem for OverlayFS {
     async fn rmdir(&self, parent_ino: i64, name: &str) -> Result<()> {
         trace!("OverlayFS::rmdir: parent_ino={}, name={}", parent_ino, name);
 
+        let resolved_name = self.resolve_name(parent_ino, name).await?;
+        let name = resolved_name.as_str();
         let parent_info = self.get_inode_info(parent_ino).ok_or(FsError::NotFound)?;
         let path = self.build_path(parent_ino, name)?;
 
@@ -721,6 +733,11 @@ impl FileSystem for OverlayFS {
             newname
         );
 
+        let resolved_newname = self.resolve_name(newparent_ino, newname).await?;
+        let newname = resolved_newname.as_str();
+        if self.lookup(newparent_ino, newname).await?.is_some() {
+            return Err(FsError::AlreadyExists.into());
+        }
         let info = self.get_inode_info(ino).ok_or(FsError::NotFound)?;
         let parent_info = self
             .get_inode_info(newparent_ino)
@@ -776,6 +793,21 @@ impl FileSystem for OverlayFS {
             newname
         );
 
+        let resolved_oldname = self.resolve_name(oldparent_ino, oldname).await?;
+        let oldname = resolved_oldname.as_str();
+        let same_name = oldparent_ino == newparent_ino && self.base.names_equal(oldname, newname);
+        let resolved_newname = if same_name {
+            newname.to_owned()
+        } else {
+            self.resolve_name(newparent_ino, newname).await?
+        };
+        let newname = resolved_newname.as_str();
+        if same_name && oldname == newname {
+            self.lookup(oldparent_ino, oldname)
+                .await?
+                .ok_or(FsError::NotFound)?;
+            return Ok(None);
+        }
         let old_parent_info = self
             .get_inode_info(oldparent_ino)
             .ok_or(FsError::NotFound)?;
@@ -804,10 +836,13 @@ impl FileSystem for OverlayFS {
             return Err(FsError::CrossDevice.into());
         }
 
-        let replaced_ino = self
-            .lookup(newparent_ino, newname)
-            .await?
-            .map(|stats| stats.ino);
+        let replaced_ino = if same_name {
+            None
+        } else {
+            self.lookup(newparent_ino, newname)
+                .await?
+                .map(|stats| stats.ino)
+        };
 
         // Remove any destination whiteout before source copy-up. The whiteout
         // mutation runs in its own IMMEDIATE transaction and can fail under
@@ -817,7 +852,16 @@ impl FileSystem for OverlayFS {
 
         // Ensure source is in delta after destination whiteout removal succeeds.
         let delta_src_ino = if src_info.layer == Layer::Base {
-            self.copy_up(&old_path, src_info.underlying_ino).await?
+            if self.partial_origin_policy.permits(&src_stats) {
+                // A native identity may be shared by multiple names. Copy up the name
+                // this rename actually addresses, not the inode cache's first alias.
+                let mut rename_info = src_info.clone();
+                rename_info.path = old_path.clone();
+                self.partial_copy_up_and_update_mapping(src_stats.ino, &rename_info)
+                    .await?
+            } else {
+                self.copy_up(&old_path, src_info.underlying_ino).await?
+            }
         } else {
             src_info.underlying_ino
         };
@@ -835,6 +879,15 @@ impl FileSystem for OverlayFS {
             .await?
             .ok_or(FsError::NotFound)?;
 
+        // An origin-linked alias can resolve to this delta inode without its
+        // own delta directory entry. Materialize this rename's source relation.
+        if FileSystem::lookup(&self.delta, delta_src_parent_ino, oldname)
+            .await?
+            .is_none()
+        {
+            FileSystem::link(&self.delta, delta_src_ino, delta_src_parent_ino, oldname).await?;
+        }
+
         // Perform rename in delta
         FileSystem::rename(
             &self.delta,
@@ -844,11 +897,20 @@ impl FileSystem for OverlayFS {
             newname,
         )
         .await?;
+        if let Some(replaced_ino) = replaced_ino {
+            let replaced = self
+                .get_inode_info(replaced_ino)
+                .expect("rename replacement inode was looked up");
+            if replaced.layer == Layer::Delta {
+                self.cleanup_partial_origin_if_unlinked(replaced.underlying_ino)
+                    .await?;
+            }
+        }
         self.refresh_overlay_mapping(src_stats.ino, Layer::Delta, delta_src_ino, &new_path);
 
         // If the old file is still visible through the overlay after the rename,
         // it must be coming from the base layer — create a whiteout to hide it.
-        if self.lookup(oldparent_ino, oldname).await?.is_some() {
+        if !same_name && self.lookup(oldparent_ino, oldname).await?.is_some() {
             self.create_whiteout(&old_path).await?;
         }
 

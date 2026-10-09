@@ -3824,6 +3824,8 @@ dependencies = [
  "tokio",
  "tracing",
  "turso",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3853,6 +3855,7 @@ version = "1.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "cc",
  "libc",
  "tempfile",
  "tokio",

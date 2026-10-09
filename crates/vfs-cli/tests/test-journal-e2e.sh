@@ -2,7 +2,7 @@
 #
 # Operation journal and content-addressed chunk storage end to end:
 # mounted mutations, live-chunk dedupe, journal kill switch, pack floor,
-# and forward migration of an old artifact through adopt.
+# and refusal of an unsupported old artifact through adopt.
 #
 set -eu
 
@@ -378,64 +378,15 @@ report = json.load(open(sys.argv[1]))
 assert report["ok"] is True, report
 PY
 
-# --- Old artifact adopts forward -------------------------------------------
+# --- Unsupported artifact is refused before adoption ------------------------
 OLD_ARTIFACT="$TEST_ROOT/v0_4-artifact.db"
 cp "$FIXTURES/v0_4.db" "$OLD_ARTIFACT"
-chmod 600 "$OLD_ARTIFACT"
-# The whole section runs under the kill switch: adopt's forward migration
-# journals a root_init row when the runner's uid differs from the fixture
-# creator's, which made a bare row-count assertion uid-dependent.
-run_vfs_without_journal adopt "$ADOPT_ID" --db "$OLD_ARTIFACT" --base "$BASE" --pin "$BASE_PIN" \
-    --json >"$TEST_ROOT/adopt-old.json" ||
-    fail "adopt failed to migrate the v0.4 artifact"
-python3 - "$TEST_ROOT/adopt-old.json" "$ADOPT_ID" <<'PY' || fail "old-artifact adopt manifest was malformed"
-import json
-import sys
-manifest = json.load(open(sys.argv[1]))
-assert manifest["sessionId"] == sys.argv[2], manifest
-assert manifest["schemaVersion"] == "0.8", manifest
-PY
-
-run_vfs_without_journal run --session "$ADOPT_ID" -- /bin/bash -c '
-test "$(cat dir/small.txt)" = "hello fixture"
-' || fail "adopted v0.4 artifact did not serve its migrated contents"
-
-ADOPTED_DB="$TEST_HOME/.vfs/run/$ADOPT_ID/delta.db"
-ADOPTED_SNAPSHOT="$TEST_ROOT/adopted-old.db"
-snapshot_db "$ADOPTED_DB" "$ADOPTED_SNAPSHOT"
-python3 - "$ADOPTED_SNAPSHOT" <<'PY' || fail "adopted old-artifact schema assertions failed"
-import sqlite3
-import sys
-
-conn = sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True)
-assert conn.execute("PRAGMA user_version").fetchone()[0] == 8
-tables = {
-    row[0]
-    for row in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table'"
-    )
-}
-required = {
-    "fs_chunk",
-    "fs_op_journal",
-    "fs_snapshot",
-    "fs_snapshot_inode",
-    "fs_snapshot_dentry",
-    "fs_snapshot_data",
-    "fs_snapshot_chunk",
-}
-assert required <= tables, sorted(required - tables)
-assert "fs_journal_chunk" not in tables, "v0.8 must not carry the journal pin table"
-columns = [row[1] for row in conn.execute("PRAGMA table_info(fs_data)")]
-assert columns == ["ino", "chunk_index", "digest"], columns
-assert conn.execute(
-    "SELECT COUNT(*) FROM fs_data WHERE typeof(digest) != 'blob' OR length(digest) != 32"
-).fetchone()[0] == 0
-assert conn.execute("SELECT COUNT(*) FROM fs_op_journal").fetchone()[0] == 0
-assert conn.execute(
-    "SELECT COUNT(*) FROM fs_snapshot WHERE reason = 'migrate' AND history_epoch = 1 AND through_seq = 0"
-).fetchone()[0] == 1
-conn.close()
-PY
+cp "$OLD_ARTIFACT" "$TEST_ROOT/old-before.db"
+if run_vfs_without_journal adopt "$ADOPT_ID" --db "$OLD_ARTIFACT" --base "$BASE" --pin "$BASE_PIN" \
+    --json >"$TEST_ROOT/adopt-old.json" 2>"$TEST_ROOT/adopt-old.err"; then
+    fail "adopt accepted an unsupported v0.4 artifact"
+fi
+cmp "$OLD_ARTIFACT" "$TEST_ROOT/old-before.db" || fail "adopt modified the original artifact"
+[ ! -e "$TEST_HOME/.vfs/run/$ADOPT_ID/delta.db" ] || fail "adopt installed an unsupported artifact"
 
 echo "OK"

@@ -1,3 +1,4 @@
+pub mod base_fingerprint;
 pub mod history;
 pub mod host;
 pub mod overlay;
@@ -15,10 +16,11 @@ pub use history::{
 };
 #[cfg(target_os = "macos")]
 pub use host::HostFS;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub use host::HostFS;
 pub use overlay::{
-    OverlayFS, PartialOriginMode, PartialOriginPolicy, DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES,
+    BaseValidator, OverlayFS, PartialOriginMode, PartialOriginPolicy,
+    DEFAULT_PARTIAL_ORIGIN_THRESHOLD_BYTES,
 };
 pub use vfs::{journal_gc, ImportEntry, ImportOptions, ImportSession, ImportedEntry, Vfs};
 
@@ -281,6 +283,30 @@ pub trait FileSystem: Send + Sync {
     ///
     /// Returns `Ok(None)` if the entry does not exist.
     async fn lookup(&self, parent_ino: i64, name: &str) -> Result<Option<Stats>>;
+
+    /// Base namespace semantics, independent of the delta storage's spelling.
+    fn names_equal(&self, left: &str, right: &str) -> bool {
+        left == right
+    }
+
+    /// Stable identity across composing bases, independent of paths and process-local inodes.
+    /// Separate files created in different deltas must differ; aliases and copy-up keep identity.
+    fn file_identity(&self, _ino: i64) -> Result<String> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "base adapter must provide persistent identity",
+        )
+        .into())
+    }
+
+    /// Return the actual entry spelling without recursively enumerating the base.
+    async fn lookup_named(&self, parent_ino: i64, name: &str) -> Result<Option<DirEntry>> {
+        Ok(self.lookup(parent_ino, name).await?.map(|stats| DirEntry {
+            name: name.to_owned(),
+            stats,
+            cookie: 0,
+        }))
+    }
 
     /// Get file attributes for an inode.
     ///

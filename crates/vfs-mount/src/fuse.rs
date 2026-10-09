@@ -66,7 +66,7 @@ pub(super) fn mount_fuse(
 
     let fs_arc: Arc<dyn vfs_core::FileSystem> = Arc::new(ReadWriteLaneFsAdapter::new(fs));
 
-    let rt = crate::get_runtime();
+    let rt = super::get_runtime();
     let mut fuse_session = vfs_fuse::mount(fs_arc, fuse_opts, rt)?;
 
     // The readiness probe stats the mountpoint, which can block indefinitely
